@@ -1,16 +1,20 @@
 use std::{
-    cmp::min,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Mutex,
     },
     thread,
 };
-use std::fmt::Debug;
-use revm::primitives::TxEnv;
-use smallvec::SmallVec;
+use std::collections::HashMap;
+use std::time::Instant;
+use alloy_consensus::BlockHeader;
+use crossbeam::channel;
+use revm::primitives::{AccessListItem, TxEnv};
+use rustc_hash::FxHashSet;
 
 use crate::{FinishExecFlags, IncarnationStatus, Task, TxIdx, TxStatus, TxVersion};
+use crate::IncarnationStatus::{Executed, ReadyToExecute};
+use crate::scheduler::Scheduler;
 
 // The Pevm collaborative scheduler coordinates execution & validation
 // tasks among work threads.
@@ -37,36 +41,8 @@ use crate::{FinishExecFlags, IncarnationStatus, Task, TxIdx, TxStatus, TxVersion
 // transactions. Threads that perform these tasks can already detect validation
 // failure due to the ESTIMATE markers on memory locations, instead of waiting
 // for a subsequent incarnation to finish.
-
-pub(crate) trait Scheduler : Send + Sync + Debug {
-    fn abort(&self);
-    fn try_execute(&self, tx_idx: TxIdx) -> Option<TxVersion>;
-    fn next_task(&self) -> Option<Task>;
-    // Add [tx_idx] as a dependent of [blocking_tx_idx] so [tx_idx] is
-    // re-executed when the next [blocking_tx_idx] incarnation is executed.
-    // Return [false] if we encounter a race condition when [blocking_tx_idx]
-    // gets re-executed before the dependency can be added.
-    fn add_dependency(&self, tx_idx: TxIdx, blocking_tx_idx: TxIdx) -> bool;
-    fn set_ready_status(&self, tx_idx: TxIdx);
-    fn finish_execution(
-        &self,
-        tx_version: TxVersion,
-        flags: FinishExecFlags,
-    ) -> Option<Task>;
-    // Return whether the abort was successful. A successful abort leads to
-    // scheduling the transaction for re-execution and the higher transactions
-    // for validation during [finish_validation]. The scheduler ensures that only
-    // one failing validation per version can lead to a successful abort.
-    fn try_validation_abort(&self, tx_version: &TxVersion) -> bool;
-    // When there is a successful abort, schedule the transaction for re-execution
-    // and the higher transactions for validation. The re-execution task is returned
-    // for the aborted transaction.
-    fn finish_validation(&self, tx_version: &TxVersion, aborted: bool) -> Option<Task>;
-}
-
-
 #[derive(Debug)]
-pub(crate) struct BlockSTMScheduler {
+pub(crate) struct ChironScheduler {
     // The number of transactions in this block.
     block_size: usize,
     // The most up-to-date incarnation number (initially 0) and
@@ -74,11 +50,12 @@ pub(crate) struct BlockSTMScheduler {
     // TODO: Consider packing [TxStatus]s into atomics instead of
     // [Mutex] given how small they are.
     transactions_status: Vec<Mutex<TxStatus>>,
-    // The list of dependent transactions to resume when the
-    // key transaction is re-executed.
-    transactions_dependents: Vec<Mutex<SmallVec<[TxIdx; 1]>>>,
-    // The next transaction to try and execute.
-    execution_idx: AtomicUsize,
+    // The list of dependent transactions to queue for execution when the
+    // key transaction finished executing.
+    transactions_dependents: Vec<FxHashSet<TxIdx>>,
+    // The list of dependency transactions to wait for before
+    // key transaction is executed.
+    transactions_dependencies: Vec<FxHashSet<TxIdx>>,
     // The next transaction to try and validate.
     validation_idx: AtomicUsize,
     // We won't validate until we find the first non-lazy transaction that
@@ -89,13 +66,57 @@ pub(crate) struct BlockSTMScheduler {
     // True if the scheduler has been aborted, likely due to fatal execution
     // errors.
     aborted: AtomicBool,
+
+    pub(crate) default_channel: (channel::Sender<TxIdx>, channel::Receiver<TxIdx>),
+
+    pub(crate) priority_channel: (channel::Sender<TxIdx>, channel::Receiver<TxIdx>),
 }
 
-impl BlockSTMScheduler {
-    pub(crate) fn new(block_size: usize) -> Self {
+impl ChironScheduler {
+    pub(crate) fn new(block_size: usize, txs: &Vec<TxEnv>) -> Self {
+
+        let time = Instant::now();
+        let default_channel = channel::unbounded();
+        let priority_channel = channel::unbounded();
+
+        let mut res_map : HashMap<&AccessListItem, FxHashSet<TxIdx>> = HashMap::with_capacity(txs.len());
+        let mut parents: Vec<FxHashSet<TxIdx>> = Vec::with_capacity(txs.len());
+        let mut children: Vec<FxHashSet<TxIdx>> = Vec::with_capacity(txs.len());
+        for _ in 0..block_size
+        {
+            parents.push(FxHashSet::default());
+            children.push(FxHashSet::default());
+        }
+        for (idx, tx) in txs.iter().enumerate() {
+            let parent_set = parents.get_mut(idx).unwrap();
+            for hint in &tx.access_list {
+                let entry = res_map.entry(hint).or_insert_with(FxHashSet::default);
+                for &parent in entry.iter() {
+                    children.get_mut(parent).unwrap().insert(idx);
+                    parent_set.insert(parent);
+                }
+
+                entry.insert(idx);
+            }
+        }
+
+        for idx in 0..block_size {
+            let local_parents = parents.get(idx).unwrap();
+            let local_children = children.get(idx).unwrap();
+            if local_parents.is_empty() {
+                if local_children.is_empty() {
+                    default_channel.0.send(idx).unwrap();
+                } else {
+                    priority_channel.0.send(idx).unwrap();
+                }
+            }
+        }
+
+        let passed = time.elapsed().as_millis();
+        // 3ms for 1000
+
         Self {
             block_size,
-            execution_idx: AtomicUsize::new(0),
             transactions_status: (0..block_size)
                 .map(|_| {
                     Mutex::new(TxStatus {
@@ -104,20 +125,23 @@ impl BlockSTMScheduler {
                     })
                 })
                 .collect(),
-            transactions_dependents: (0..block_size).map(|_| Mutex::default()).collect(),
+            transactions_dependents: children,
+            transactions_dependencies: parents,
             // We won't validate until we find the first non-lazy transaction that
             // needs to read explicit values. We also skip the first transaction.
             validation_idx: AtomicUsize::new(block_size),
             min_validation_idx: AtomicUsize::new(block_size),
             num_validated: AtomicUsize::new(0),
             aborted: AtomicBool::new(false),
+            default_channel,
+            priority_channel
         }
     }
 }
 
 // TODO: Better error handling.
 // Like returning errors instead of panicking on [unreachable]s.
-impl Scheduler for BlockSTMScheduler {
+impl Scheduler for ChironScheduler {
     fn abort(&self) {
         self.aborted.store(true, Ordering::Relaxed);
     }
@@ -138,11 +162,29 @@ impl Scheduler for BlockSTMScheduler {
 
     fn next_task(&self) -> Option<Task> {
         while !self.aborted.load(Ordering::Relaxed) {
-            let execution_idx = self.execution_idx.load(Ordering::Relaxed);
+
+            // Check in priority channel for a task.
+            if let Ok(tx_id) = self.priority_channel.1.try_recv() {
+                // Prioritize execution task
+                if let Some(tx_version) = self.try_execute(tx_id)
+                {
+                    return Some(Task::Execution(tx_version));
+                }
+            }
+
+            // Check in default channel for a task.
+            if let Ok(tx_id) = self.default_channel.1.try_recv() {
+                // Prioritize execution task
+                if let Some(tx_version) = self.try_execute(tx_id)
+                {
+                    return Some(Task::Execution(tx_version));
+                }
+            }
+
+            // Check if we finished and can stop execution.
             let validation_idx = self.validation_idx.load(Ordering::Relaxed);
-            if execution_idx >= self.block_size && validation_idx >= self.block_size {
-                if self.num_validated.load(Ordering::Relaxed)
-                    >= self.block_size - self.min_validation_idx.load(Ordering::Relaxed)
+            if validation_idx >= self.block_size {
+                if self.num_validated.load(Ordering::Relaxed) >= self.block_size - self.min_validation_idx.load(Ordering::Relaxed)
                 {
                     break;
                 }
@@ -150,26 +192,24 @@ impl Scheduler for BlockSTMScheduler {
                 continue;
             }
 
-            // Prioritize a validation task to minimize re-execution
-            if validation_idx < execution_idx {
-                let tx_idx = self.validation_idx.fetch_add(1, Ordering::Relaxed);
-                if tx_idx < self.block_size {
-                    let mut tx = index_mutex!(self.transactions_status, tx_idx);
+            //todo do we need re-execute?
+
+            // Check if we can do validation.
+            if self.transactions_status.get(validation_idx).unwrap().lock().unwrap().status == Executed {
+                if validation_idx < self.block_size {
+                    let mut tx = index_mutex!(self.transactions_status, validation_idx);
                     // "Steal" execution job while holding the lock
                     if tx.status == IncarnationStatus::ReadyToExecute {
                         tx.status = IncarnationStatus::Executing;
                         return Some(Task::Execution(TxVersion {
-                            tx_idx,
+                            tx_idx: validation_idx,
                             tx_incarnation: tx.incarnation,
                         }));
                     }
                     // Start a typical validation task
-                    if matches!(
-                        tx.status,
-                        IncarnationStatus::Executed | IncarnationStatus::Validated
-                    ) {
+                    if matches!(tx.status,IncarnationStatus::Executed | IncarnationStatus::Validated) {
                         return Some(Task::Validation(TxVersion {
-                            tx_idx,
+                            tx_idx: validation_idx,
                             tx_incarnation: tx.incarnation,
                         }));
                     }
@@ -183,13 +223,6 @@ impl Scheduler for BlockSTMScheduler {
                     // decide if validation is needed when it's done. If it
                     // does, all validation tasks here would be redone anyway.
                 }
-            }
-
-            // Prioritize execution task
-            if let Some(tx_version) =
-                self.try_execute(self.execution_idx.fetch_add(1, Ordering::Relaxed))
-            {
-                return Some(Task::Execution(tx_version));
             }
         }
         None
@@ -214,9 +247,9 @@ impl Scheduler for BlockSTMScheduler {
         debug_assert_eq!(tx.status, IncarnationStatus::Executing);
         tx.status = IncarnationStatus::Aborting;
 
-        let mut blocking_dependents = index_mutex!(self.transactions_dependents, blocking_tx_idx);
-        blocking_dependents.push(tx_idx);
-
+        //let mut blocking_dependents = index_mutex!(self.transactions_dependents, blocking_tx_idx);
+        //blocking_dependents.push(tx_idx);
+        panic!("This should never happen. Transaction detected as dependent");
         true
     }
 
@@ -237,48 +270,24 @@ impl Scheduler for BlockSTMScheduler {
         debug_assert_eq!(tx.incarnation, tx_version.tx_incarnation);
 
         // Resume dependent transactions
-        let mut dependents = index_mutex!(self.transactions_dependents, tx_version.tx_idx);
-        for tx_idx in dependents.drain(..) {
-            self.set_ready_status(tx_idx);
-            self.execution_idx.fetch_min(tx_idx, Ordering::Relaxed);
-        }
 
-        // TODO: Simplify or better document this logic.
-        // Decide where to validate from next
-        let min_validation_idx = if flags.contains(FinishExecFlags::NeedValidation) {
-            min(
-                self.min_validation_idx
-                    .fetch_min(tx_version.tx_idx, Ordering::Relaxed),
-                tx_version.tx_idx,
-            )
-        } else {
-            self.min_validation_idx.load(Ordering::Relaxed)
-        };
-        // Have found a min validation index to even bother
-        if min_validation_idx < self.block_size {
-            // Must re-validate from min as this transaction is lower
-            if tx_version.tx_idx < min_validation_idx {
-                if flags.contains(FinishExecFlags::WroteNewLocation) {
-                    self.validation_idx
-                        .fetch_min(min_validation_idx, Ordering::Relaxed);
+        let mut followup_tx = 0;
+        // check through transactions, and put into queue the transaction with no more parents missing to execute.
+        for dependent in self.transactions_dependents.get(tx_version.tx_idx).unwrap().iter() {
+            if self.transactions_status.get(*dependent).unwrap().lock().unwrap().status == ReadyToExecute {
+                for dependency in self.transactions_dependencies.get(*dependent).unwrap().iter() {
+                    if *dependency != tx_version.tx_idx && self.transactions_status.get(*dependency).unwrap().lock().unwrap().status != Executed {
+                        break;
+                    }
+                }
+                if self.transactions_dependents.get(*dependent).unwrap().is_empty() {
+                    self.default_channel.0.send(*dependent).unwrap()
+                } else if followup_tx == 0 {
+                    followup_tx = *dependent;
+                } else {
+                    self.priority_channel.0.send(*dependent).unwrap()
                 }
             }
-            // Validate from this transaction as it's in between min and the current
-            // validation index.
-            else if tx_version.tx_idx < self.validation_idx.load(Ordering::Relaxed) {
-                if flags.contains(FinishExecFlags::WroteNewLocation) {
-                    self.validation_idx
-                        .fetch_min(tx_version.tx_idx + 1, Ordering::Relaxed);
-                }
-                if flags.contains(FinishExecFlags::NeedValidation) {
-                    tx.status = IncarnationStatus::Executed;
-                    return Some(Task::Validation(tx_version));
-                }
-                tx.status = IncarnationStatus::Validated;
-                self.num_validated.fetch_add(1, Ordering::Relaxed);
-            }
-            // Don't need to validate anything if the current validation index is
-            // lower or equal -- it will catch up later.
         }
 
         if flags.contains(FinishExecFlags::NeedValidation) {
@@ -286,6 +295,13 @@ impl Scheduler for BlockSTMScheduler {
         } else {
             tx.status = IncarnationStatus::Validated;
             self.num_validated.fetch_add(1, Ordering::Relaxed);
+        }
+
+        if followup_tx != 0 {
+            let version = self.try_execute(followup_tx);
+            if let Some(version) = version {
+                return Some(Task::Execution(version));
+            }
         }
         None
     }
@@ -316,11 +332,7 @@ impl Scheduler for BlockSTMScheduler {
     fn finish_validation(&self, tx_version: &TxVersion, aborted: bool) -> Option<Task> {
         if aborted {
             self.set_ready_status(tx_version.tx_idx);
-            self.validation_idx
-                .fetch_min(tx_version.tx_idx + 1, Ordering::Relaxed);
-            if self.execution_idx.load(Ordering::Relaxed) > tx_version.tx_idx {
-                return self.try_execute(tx_version.tx_idx).map(Task::Execution);
-            }
+            self.validation_idx.fetch_add(1, Ordering::Relaxed);
         } else {
             let mut tx = index_mutex!(self.transactions_status, tx_version.tx_idx);
             if tx.status == IncarnationStatus::Executed {

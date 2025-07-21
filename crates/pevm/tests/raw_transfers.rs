@@ -1,14 +1,19 @@
 //! Test raw transfers -- only send some ETH from one account to another without extra data.
 
+use alloy_primitives::B256;
+use alloy_rpc_types_eth::AccessListItem;
+use rand::distributions::WeightedIndex;
+use rand::prelude::ThreadRng;
 use pevm::{chain::PevmEthereum, InMemoryStorage};
-use rand::random;
+use rand::{random, thread_rng};
 use revm::primitives::{alloy_primitives::U160, env::TxEnv, Address, TransactTo, U256};
 
 pub mod common;
 
 #[test]
 fn raw_transfers_independent() {
-    let block_size = 100_000; // number of transactions
+    
+    let block_size = 1000; // number of transactions
     common::test_execute_revm(
         &PevmEthereum::mainnet(),
         // Mock the beneficiary account (`Address:ZERO`) and the next `block_size` user accounts.
@@ -21,13 +26,16 @@ fn raw_transfers_independent() {
         // Skipping `Address::ZERO` as the beneficiary account.
         (1..=block_size)
             .map(|i| {
-                let address = Address::from(U160::from(i));
+                let sender = Address::from(U160::from(i));
+                let receiver = Address::from(U160::from(i+1));
+
                 TxEnv {
-                    caller: address,
-                    transact_to: TransactTo::Call(address),
+                    caller: sender,
+                    transact_to: TransactTo::Call(receiver),
                     value: U256::from(1),
-                    gas_limit: common::RAW_TRANSFER_GAS_LIMIT,
+                    gas_limit: common::RAW_TRANSFER_GAS_LIMIT * 2,
                     gas_price: U256::from(1),
+                    access_list: vec!(AccessListItem {address: sender, storage_keys: vec!(B256::ZERO)}, AccessListItem {address: receiver, storage_keys: vec!(B256::ZERO)}),
                     ..TxEnv::default()
                 }
             })

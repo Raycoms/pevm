@@ -220,6 +220,7 @@ mod mv_memory;
 mod pevm;
 pub use pevm::{execute_revm_sequential, Pevm, PevmError, PevmResult};
 mod scheduler;
+mod chiron_scheduler;
 mod storage;
 pub use storage::{
     AccountBasic, BlockHashes, Bytecodes, ChainState, EvmAccount, EvmCode, InMemoryStorage,

@@ -4,14 +4,17 @@
 
 use std::{num::NonZeroUsize, sync::Arc, thread};
 
-use alloy_primitives::{Address, U160, U256};
+use alloy_primitives::{Address, B256, U160, U256};
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use rand::distributions::{Distribution, WeightedIndex};
+use rand::rngs::ThreadRng;
+use rand::thread_rng;
 use pevm::{
     chain::PevmEthereum, execute_revm_sequential, Bytecodes, ChainState, EvmAccount,
     InMemoryStorage, Pevm,
 };
-use revm::primitives::{BlockEnv, SpecId, TransactTo, TxEnv};
-
+use revm::primitives::{AccessListItem, BlockEnv, SpecId, TransactTo, TxEnv};
+use crate::p2p::{TX_FROM, TX_TO};
 // Better project structure
 
 /// common module
@@ -25,6 +28,10 @@ pub mod erc20;
 /// uniswap module
 #[path = "../tests/uniswap/mod.rs"]
 pub mod uniswap;
+
+// p2p evaluation data.
+#[path = "data/p2p.rs"]
+pub mod p2p;
 
 ///  large gas value
 const GIGA_GAS: u64 = 1_000_000_000;
@@ -41,6 +48,9 @@ pub fn bench(c: &mut Criterion, name: &str, storage: InMemoryStorage, txs: Vec<T
     let block_env = BlockEnv::default();
     let mut pevm = Pevm::default();
     let mut group = c.benchmark_group(name);
+
+    //todo, how can we load the hints into the txs.
+
     group.bench_function("Sequential", |b| {
         b.iter(|| {
             execute_revm_sequential(
@@ -72,28 +82,40 @@ pub fn bench_raw_transfers(c: &mut Criterion) {
     let block_size = (GIGA_GAS as f64 / common::RAW_TRANSFER_GAS_LIMIT as f64).ceil() as usize;
     // Skip the built-in precompiled contracts addresses.
     const START_ADDRESS: usize = 1000;
+    println!("go1 {} ", block_size);
+
     const MINER_ADDRESS: usize = 0;
     let storage = InMemoryStorage::new(
         std::iter::once(MINER_ADDRESS)
-            .chain(START_ADDRESS..START_ADDRESS + block_size)
+            .chain(START_ADDRESS..100_000)
             .map(common::mock_account)
             .collect(),
         Default::default(),
         Default::default(),
     );
+
+    let p2p_receiver_distribution: WeightedIndex<f64> = WeightedIndex::new(&TX_FROM).unwrap();
+    let p2p_sender_distribution: WeightedIndex<f64> = WeightedIndex::new(&TX_TO).unwrap();
+    let mut rng: ThreadRng = thread_rng();
+
+    println!("go2");
+    //todo add access list here and add our transfer distribution here.
     bench(
         c,
         "Independent Raw Transfers",
         storage,
         (0..block_size)
             .map(|i| {
-                let address = Address::from(U160::from(START_ADDRESS + i));
+                let sender = Address::from(U160::from(START_ADDRESS + p2p_sender_distribution.sample(&mut rng)));
+                let receiver = Address::from(U160::from(START_ADDRESS + p2p_receiver_distribution.sample(&mut rng)));
+
                 TxEnv {
-                    caller: address,
-                    transact_to: TransactTo::Call(address),
+                    caller: sender,
+                    transact_to: TransactTo::Call(receiver),
                     value: U256::from(1),
                     gas_limit: common::RAW_TRANSFER_GAS_LIMIT,
                     gas_price: U256::from(1),
+                    access_list: vec!(AccessListItem {address: sender, storage_keys: vec!(B256::ZERO)}, AccessListItem {address: receiver, storage_keys: vec!(B256::ZERO)}),
                     ..TxEnv::default()
                 }
             })
@@ -137,8 +159,8 @@ pub fn bench_uniswap(c: &mut Criterion) {
 /// Runs a series of benchmarks to evaluate the performance of different transaction types.
 pub fn benchmark_gigagas(c: &mut Criterion) {
     bench_raw_transfers(c);
-    bench_erc20(c);
-    bench_uniswap(c);
+    //bench_erc20(c);
+    //bench_uniswap(c);
 }
 
 // HACK: we can't document public items inside of the macro

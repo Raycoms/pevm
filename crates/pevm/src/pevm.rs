@@ -19,13 +19,15 @@ use crate::{
     compat::get_block_env,
     hash_deterministic,
     mv_memory::MvMemory,
-    scheduler::Scheduler,
+    scheduler::BlockSTMScheduler,
     storage::StorageWrapper,
     vm::{
         build_evm, ExecutionError, PevmTxExecutionResult, Vm, VmExecutionError, VmExecutionResult,
     },
     EvmAccount, MemoryEntry, MemoryLocation, MemoryValue, Storage, Task, TxIdx, TxVersion,
 };
+use crate::chiron_scheduler::ChironScheduler;
+use crate::scheduler::Scheduler;
 
 /// Errors when executing a block with pevm.
 // TODO: implement traits explicitly due to trait bounds on `C` instead of types of `PevmChain`
@@ -106,7 +108,7 @@ impl<T> AsyncDropper<T> {
 pub struct Pevm {
     execution_results: Vec<Mutex<Option<PevmTxExecutionResult>>>,
     abort_reason: OnceLock<AbortReason>,
-    dropper: AsyncDropper<(MvMemory, Scheduler, Vec<TxEnv>)>,
+    dropper: AsyncDropper<(MvMemory, Box<dyn Scheduler + Send + Sync>, Vec<TxEnv>)>,
 }
 
 impl Pevm {
@@ -181,7 +183,13 @@ impl Pevm {
         }
 
         let block_size = txs.len();
-        let scheduler = Scheduler::new(block_size);
+        let scheduler : Box<dyn Scheduler + Send + Sync>;
+        if false {
+            scheduler = Box::new(BlockSTMScheduler::new(block_size));
+        } else {
+            scheduler = Box::new(ChironScheduler::new(block_size, &txs));
+        }
+
 
         let mv_memory = chain.build_mv_memory(&block_env, &txs);
         let vm = Vm::new(storage, &mv_memory, chain, &block_env, &txs, spec_id);
@@ -226,6 +234,8 @@ impl Pevm {
                 });
             }
         });
+
+        println!("Finished parallel");
 
         if let Some(abort_reason) = self.abort_reason.take() {
             match abort_reason {
@@ -380,7 +390,7 @@ impl Pevm {
     fn try_execute<S: Storage, C: PevmChain>(
         &self,
         vm: &Vm<'_, S, C>,
-        scheduler: &Scheduler,
+        scheduler: &Box<dyn Scheduler + Send + Sync>,
         tx_version: TxVersion,
     ) -> Option<Task> {
         loop {
@@ -428,7 +438,7 @@ impl Pevm {
 
 fn try_validate(
     mv_memory: &MvMemory,
-    scheduler: &Scheduler,
+    scheduler: &Box<dyn Scheduler + Send + Sync>,
     tx_version: &TxVersion,
 ) -> Option<Task> {
     let read_set_valid = mv_memory.validate_read_locations(tx_version.tx_idx);
