@@ -5,16 +5,32 @@ use std::{
     },
     thread,
 };
-use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+use std::collections::HashSet;
 use std::time::Instant;
 use alloy_consensus::BlockHeader;
 use crossbeam::channel;
+use nohash_hasher::BuildNoHashHasher;
 use revm::primitives::{AccessListItem, TxEnv};
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
 use crate::{FinishExecFlags, IncarnationStatus, Task, TxIdx, TxStatus, TxVersion};
-use crate::IncarnationStatus::{Executed, ReadyToExecute};
+use crate::IncarnationStatus::{Executed, ReadyToExecute, Validated};
 use crate::scheduler::Scheduler;
+
+type IntSet = HashSet<usize, BuildNoHashHasher<usize>>;
+
+// This optimization is desired as we constantly index into many
+// vectors of the block-size size. It can yield up to 5% improvement.
+macro_rules! vec_access {
+    ($vec:expr, $index:expr) => {
+        // SAFETY: A correct scheduler would not leak indexes larger
+        // than the block size, which is the size of all vectors we
+        // index via this macro. Otherwise, DO NOT USE!
+        unsafe { $vec.get_unchecked_mut($index) }
+    };
+}
+
 
 // The Pevm collaborative scheduler coordinates execution & validation
 // tasks among work threads.
@@ -52,10 +68,10 @@ pub(crate) struct ChironScheduler {
     transactions_status: Vec<Mutex<TxStatus>>,
     // The list of dependent transactions to queue for execution when the
     // key transaction finished executing.
-    transactions_dependents: Vec<FxHashSet<TxIdx>>,
+    transactions_dependents: Vec<IntSet>,
     // The list of dependency transactions to wait for before
     // key transaction is executed.
-    transactions_dependencies: Vec<FxHashSet<TxIdx>>,
+    transactions_dependencies: Vec<IntSet>,
     // The next transaction to try and validate.
     validation_idx: AtomicUsize,
     // We won't validate until we find the first non-lazy transaction that
@@ -79,27 +95,33 @@ impl ChironScheduler {
         let default_channel = channel::unbounded();
         let priority_channel = channel::unbounded();
 
-        let mut res_map : HashMap<&AccessListItem, FxHashSet<TxIdx>> = HashMap::with_capacity(txs.len());
-        let mut parents: Vec<FxHashSet<TxIdx>> = Vec::with_capacity(txs.len());
-        let mut children: Vec<FxHashSet<TxIdx>> = Vec::with_capacity(txs.len());
+        let mut res_map : FxHashMap<&AccessListItem, TxIdx> = FxHashMap::with_capacity_and_hasher(txs.len(), FxBuildHasher::default());
+        let mut parents: Vec<IntSet> = Vec::with_capacity(txs.len());
+        let mut children: Vec<IntSet> = Vec::with_capacity(txs.len());
         for _ in 0..block_size
         {
-            parents.push(FxHashSet::default());
-            children.push(FxHashSet::default());
+            parents.push(IntSet::default());
+            children.push(IntSet::default());
         }
-        for (idx, tx) in txs.iter().enumerate() {
-            let parent_set = parents.get_mut(idx).unwrap();
-            for hint in &tx.access_list {
-                let entry = res_map.entry(hint).or_insert_with(FxHashSet::default);
-                for &parent in entry.iter() {
-                    children.get_mut(parent).unwrap().insert(idx);
-                    parent_set.insert(parent);
-                }
 
-                entry.insert(idx);
+        for (idx, tx) in txs.iter().enumerate() {
+            let parent_set = vec_access!(parents, idx);
+            for hint in &tx.access_list {
+                match res_map.entry(hint) {
+                    Entry::Occupied(mut entry) => {
+                        let parent = *entry.get();
+                        vec_access!(children, parent).insert(idx);
+                        parent_set.insert(parent);
+
+                        entry.insert(idx);
+                    }
+                    Entry::Vacant(entry) => {
+                        entry.insert(idx);
+                    }
+                }
             }
         }
-
+        
         for idx in 0..block_size {
             let local_parents = parents.get(idx).unwrap();
             let local_children = children.get(idx).unwrap();
@@ -112,7 +134,7 @@ impl ChironScheduler {
             }
         }
 
-        let passed = time.elapsed().as_millis();
+        let passed2 = time.elapsed().as_millis();
         // 3ms for 1000
 
         Self {
@@ -166,8 +188,7 @@ impl Scheduler for ChironScheduler {
             // Check in priority channel for a task.
             if let Ok(tx_id) = self.priority_channel.1.try_recv() {
                 // Prioritize execution task
-                if let Some(tx_version) = self.try_execute(tx_id)
-                {
+                if let Some(tx_version) = self.try_execute(tx_id) {
                     return Some(Task::Execution(tx_version));
                 }
             }
@@ -175,8 +196,7 @@ impl Scheduler for ChironScheduler {
             // Check in default channel for a task.
             if let Ok(tx_id) = self.default_channel.1.try_recv() {
                 // Prioritize execution task
-                if let Some(tx_version) = self.try_execute(tx_id)
-                {
+                if let Some(tx_version) = self.try_execute(tx_id) {
                     return Some(Task::Execution(tx_version));
                 }
             }
@@ -272,20 +292,29 @@ impl Scheduler for ChironScheduler {
         // Resume dependent transactions
 
         let mut followup_tx = 0;
-        // check through transactions, and put into queue the transaction with no more parents missing to execute.
-        for dependent in self.transactions_dependents.get(tx_version.tx_idx).unwrap().iter() {
-            if self.transactions_status.get(*dependent).unwrap().lock().unwrap().status == ReadyToExecute {
-                for dependency in self.transactions_dependencies.get(*dependent).unwrap().iter() {
-                    if *dependency != tx_version.tx_idx && self.transactions_status.get(*dependency).unwrap().lock().unwrap().status != Executed {
-                        break;
+
+        // For all children
+        for child in self.transactions_dependents.get(tx_version.tx_idx).unwrap().iter() {
+            if self.transactions_status.get(*child).unwrap().lock().unwrap().status == ReadyToExecute {
+                let mut can_schedule = true;
+                for parent in self.transactions_dependencies.get(*child).unwrap().iter() {
+                    if *parent != tx_version.tx_idx {
+                        let status = &self.transactions_status.get(*parent).unwrap().lock().unwrap().status;
+                        if *status != Executed && *status != Validated {
+                            can_schedule = false;
+                            break;
+                        }
                     }
                 }
-                if self.transactions_dependents.get(*dependent).unwrap().is_empty() {
-                    self.default_channel.0.send(*dependent).unwrap()
-                } else if followup_tx == 0 {
-                    followup_tx = *dependent;
-                } else {
-                    self.priority_channel.0.send(*dependent).unwrap()
+
+                if can_schedule {
+                    if self.transactions_dependents.get(*child).unwrap().is_empty() {
+                        self.default_channel.0.send(*child).unwrap();
+                    } else if followup_tx == 0 {
+                        followup_tx = *child;
+                    } else {
+                        self.priority_channel.0.send(*child).unwrap();
+                    }
                 }
             }
         }
@@ -302,6 +331,7 @@ impl Scheduler for ChironScheduler {
             if let Some(version) = version {
                 return Some(Task::Execution(version));
             }
+            self.priority_channel.0.send(followup_tx).unwrap();
         }
         None
     }
