@@ -155,6 +155,7 @@ fn run_test_unit(path: &Path, unit: TestUnit) {
                     build_block_env(&unit.env, spec_id),
                     vec![tx_env.unwrap()],
                     NonZeroUsize::MIN,
+                    false
                 ),
             ) {
                 // EIP-2681

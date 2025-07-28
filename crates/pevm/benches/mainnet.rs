@@ -57,10 +57,11 @@ pub fn criterion_benchmark(c: &mut Criterion) {
                     black_box(&block),
                     black_box(concurrency_level),
                     black_box(true),
+                    true
                 )
             })
         });
-        group.bench_function("Parallel", |b| {
+        group.bench_function("Parallel BlockSTM", |b| {
             b.iter(|| {
                 pevm.execute(
                     black_box(&chain),
@@ -68,6 +69,19 @@ pub fn criterion_benchmark(c: &mut Criterion) {
                     black_box(&block),
                     black_box(concurrency_level),
                     black_box(false),
+                    true
+                )
+            })
+        });
+        group.bench_function("Parallel Chiron", |b| {
+            b.iter(|| {
+                pevm.execute(
+                    black_box(&chain),
+                    black_box(&storage),
+                    black_box(&block),
+                    black_box(concurrency_level),
+                    black_box(false),
+                    false
                 )
             })
         });

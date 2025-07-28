@@ -41,8 +41,10 @@ serde.workspace = true
 smallvec.workspace = true
 thiserror.workspace = true
 crossbeam.workspace = true
-
 revm.workspace = true
+nohash-hasher.workspace = true
+indexset.workspace = true
+flume.workspace = true
 
 # OP dependencies
 op-alloy-consensus = { workspace = true, optional = true }
@@ -59,6 +61,7 @@ tokio = { workspace = true, optional = true }
 rpmalloc = { workspace = true, optional = true }
 snmalloc-rs = { workspace = true, optional = true }
 tikv-jemallocator = { workspace = true, optional = true }
+
 
 [dev-dependencies]
 bincode.workspace = true

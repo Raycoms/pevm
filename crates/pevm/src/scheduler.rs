@@ -7,7 +7,6 @@ use std::{
     thread,
 };
 use std::fmt::Debug;
-use revm::primitives::TxEnv;
 use smallvec::SmallVec;
 
 use crate::{FinishExecFlags, IncarnationStatus, Task, TxIdx, TxStatus, TxVersion};
@@ -62,6 +61,8 @@ pub(crate) trait Scheduler : Send + Sync + Debug {
     // and the higher transactions for validation. The re-execution task is returned
     // for the aborted transaction.
     fn finish_validation(&self, tx_version: &TxVersion, aborted: bool) -> Option<Task>;
+
+    fn inc_exec(&self);
 }
 
 
@@ -89,6 +90,8 @@ pub(crate) struct BlockSTMScheduler {
     // True if the scheduler has been aborted, likely due to fatal execution
     // errors.
     aborted: AtomicBool,
+    // Num executed
+    num_executed: AtomicUsize,
 }
 
 impl BlockSTMScheduler {
@@ -111,6 +114,7 @@ impl BlockSTMScheduler {
             min_validation_idx: AtomicUsize::new(block_size),
             num_validated: AtomicUsize::new(0),
             aborted: AtomicBool::new(false),
+            num_executed: AtomicUsize::new(0),
         }
     }
 }
@@ -118,6 +122,9 @@ impl BlockSTMScheduler {
 // TODO: Better error handling.
 // Like returning errors instead of panicking on [unreachable]s.
 impl Scheduler for BlockSTMScheduler {
+    fn inc_exec(&self) {
+        self.num_executed.fetch_add(1, Ordering::Relaxed);
+    }
     fn abort(&self) {
         self.aborted.store(true, Ordering::Relaxed);
     }
@@ -144,6 +151,7 @@ impl Scheduler for BlockSTMScheduler {
                 if self.num_validated.load(Ordering::Relaxed)
                     >= self.block_size - self.min_validation_idx.load(Ordering::Relaxed)
                 {
+                    //println!("exec: {}", self.num_executed.load(Ordering::Relaxed));
                     break;
                 }
                 thread::yield_now();
@@ -305,6 +313,7 @@ impl Scheduler for BlockSTMScheduler {
             IncarnationStatus::Executed | IncarnationStatus::Validated
         );
         if aborting {
+            self.inc_exec();
             tx.status = IncarnationStatus::Aborting;
         }
         aborting

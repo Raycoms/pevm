@@ -44,6 +44,7 @@ where
             BlockEnv::default(),
             txs,
             concurrency_level,
+            false
         ),
     );
 }
@@ -61,8 +62,8 @@ pub fn test_execute_alloy<C, S>(
 {
     let concurrency_level = thread::available_parallelism().unwrap_or(NonZeroUsize::MIN);
     let mut pevm = Pevm::default();
-    let sequential_result = pevm.execute(chain, storage, &block, concurrency_level, true);
-    let parallel_result = pevm.execute(chain, storage, &block, concurrency_level, false);
+    let sequential_result = pevm.execute(chain, storage, &block, concurrency_level, true, false);
+    let parallel_result = pevm.execute(chain, storage, &block, concurrency_level, false, false);
     assert!(sequential_result.is_ok());
     assert_eq!(&sequential_result, &parallel_result);
 

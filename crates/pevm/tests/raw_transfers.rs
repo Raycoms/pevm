@@ -2,18 +2,27 @@
 
 use alloy_primitives::B256;
 use alloy_rpc_types_eth::AccessListItem;
-use rand::distributions::WeightedIndex;
+use rand::distributions::{Distribution, WeightedIndex};
 use rand::prelude::ThreadRng;
 use pevm::{chain::PevmEthereum, InMemoryStorage};
 use rand::{random, thread_rng};
 use revm::primitives::{alloy_primitives::U160, env::TxEnv, Address, TransactTo, U256};
+use crate::p2p::{TX_FROM, TX_TO};
 
 pub mod common;
 
+/// p2p evaluation data.
+#[path = "data/p2p.rs"]
+pub mod p2p;
+
 #[test]
 fn raw_transfers_independent() {
-    
-    let block_size = 1000; // number of transactions
+
+    let p2p_receiver_distribution: WeightedIndex<f64> = WeightedIndex::new(&TX_FROM).unwrap();
+    let p2p_sender_distribution: WeightedIndex<f64> = WeightedIndex::new(&TX_TO).unwrap();
+    let mut rng: ThreadRng = thread_rng();
+
+    let block_size = 47620; // number of transactions
     common::test_execute_revm(
         &PevmEthereum::mainnet(),
         // Mock the beneficiary account (`Address:ZERO`) and the next `block_size` user accounts.
@@ -25,9 +34,9 @@ fn raw_transfers_independent() {
         // Mock `block_size` transactions sending some tokens to itself.
         // Skipping `Address::ZERO` as the beneficiary account.
         (1..=block_size)
-            .map(|i| {
-                let sender = Address::from(U160::from(i));
-                let receiver = Address::from(U160::from(i+1));
+            .map(|_| {
+                let sender = Address::from(U160::from(p2p_sender_distribution.sample(&mut rng)));
+                let receiver = Address::from(U160::from(p2p_receiver_distribution.sample(&mut rng)));
 
                 TxEnv {
                     caller: sender,

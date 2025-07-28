@@ -4,7 +4,6 @@ use std::{
     sync::{mpsc, Mutex, OnceLock},
     thread,
 };
-
 use alloy_primitives::{TxNonce, U256};
 use alloy_rpc_types_eth::{Block, BlockTransactions};
 use hashbrown::HashMap;
@@ -13,7 +12,6 @@ use revm::{
     primitives::{BlockEnv, InvalidTransaction, SpecId, TxEnv},
     DatabaseCommit,
 };
-
 use crate::{
     chain::PevmChain,
     compat::get_block_env,
@@ -127,6 +125,7 @@ impl Pevm {
         block: &Block<C::Transaction>,
         concurrency_level: NonZeroUsize,
         force_sequential: bool,
+        block_stm: bool
     ) -> PevmResult<C>
     where
         C: PevmChain + Send + Sync,
@@ -158,6 +157,7 @@ impl Pevm {
                 block_env,
                 tx_envs,
                 concurrency_level,
+                block_stm
             )
         }
     }
@@ -173,6 +173,7 @@ impl Pevm {
         block_env: BlockEnv,
         txs: Vec<TxEnv>,
         concurrency_level: NonZeroUsize,
+        block_stm: bool
     ) -> PevmResult<C>
     where
         C: PevmChain + Send + Sync,
@@ -184,7 +185,7 @@ impl Pevm {
 
         let block_size = txs.len();
         let scheduler : Box<dyn Scheduler + Send + Sync>;
-        if false {
+        if block_stm {
             scheduler = Box::new(BlockSTMScheduler::new(block_size));
         } else {
             scheduler = Box::new(ChironScheduler::new(block_size, &txs));
@@ -235,7 +236,7 @@ impl Pevm {
             }
         });
 
-        println!("Finished parallel");
+        //println!("Finished parallel: {}", time.elapsed().as_millis());
 
         if let Some(abort_reason) = self.abort_reason.take() {
             match abort_reason {
@@ -396,6 +397,7 @@ impl Pevm {
         loop {
             return match vm.execute(&tx_version) {
                 Err(VmExecutionError::Retry) => {
+                    scheduler.inc_exec();
                     if self.abort_reason.get().is_none() {
                         continue;
                     }
@@ -408,6 +410,7 @@ impl Pevm {
                     None
                 }
                 Err(VmExecutionError::Blocking(blocking_tx_idx)) => {
+                    scheduler.inc_exec();
                     if !scheduler.add_dependency(tx_version.tx_idx, blocking_tx_idx)
                         && self.abort_reason.get().is_none()
                     {
@@ -418,6 +421,7 @@ impl Pevm {
                     None
                 }
                 Err(VmExecutionError::ExecutionError(err)) => {
+                    scheduler.inc_exec();
                     scheduler.abort();
                     self.abort_reason
                         .get_or_init(|| AbortReason::ExecutionError(err));

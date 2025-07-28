@@ -1,33 +1,34 @@
 use std::{
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Mutex,
     },
     thread,
 };
 use std::collections::hash_map::Entry;
-use std::collections::HashSet;
-use std::time::Instant;
-use alloy_consensus::BlockHeader;
-use crossbeam::channel;
-use nohash_hasher::BuildNoHashHasher;
+use std::sync::RwLock;
 use revm::primitives::{AccessListItem, TxEnv};
-use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
-
+use rustc_hash::{FxBuildHasher, FxHashMap};
 use crate::{FinishExecFlags, IncarnationStatus, Task, TxIdx, TxStatus, TxVersion};
 use crate::IncarnationStatus::{Executed, ReadyToExecute, Validated};
 use crate::scheduler::Scheduler;
 
-type IntSet = HashSet<usize, BuildNoHashHasher<usize>>;
-
 // This optimization is desired as we constantly index into many
 // vectors of the block-size size. It can yield up to 5% improvement.
-macro_rules! vec_access {
+macro_rules! mut_vec_access {
     ($vec:expr, $index:expr) => {
         // SAFETY: A correct scheduler would not leak indexes larger
         // than the block size, which is the size of all vectors we
         // index via this macro. Otherwise, DO NOT USE!
         unsafe { $vec.get_unchecked_mut($index) }
+    };
+}
+
+macro_rules! vec_access {
+    ($vec:expr, $index:expr) => {
+        // SAFETY: A correct scheduler would not leak indexes larger
+        // than the block size, which is the size of all vectors we
+        // index via this macro. Otherwise, DO NOT USE!
+        unsafe { $vec.get_unchecked($index) }
     };
 }
 
@@ -65,13 +66,13 @@ pub(crate) struct ChironScheduler {
     // the status of this incarnation.
     // TODO: Consider packing [TxStatus]s into atomics instead of
     // [Mutex] given how small they are.
-    transactions_status: Vec<Mutex<TxStatus>>,
+    transactions_status: Vec<RwLock<TxStatus>>,
     // The list of dependent transactions to queue for execution when the
     // key transaction finished executing.
-    transactions_dependents: Vec<IntSet>,
+    transactions_dependents: Vec<Vec<usize>>,
     // The list of dependency transactions to wait for before
     // key transaction is executed.
-    transactions_dependencies: Vec<IntSet>,
+    transactions_dependencies: Vec<Vec<usize>>,
     // The next transaction to try and validate.
     validation_idx: AtomicUsize,
     // We won't validate until we find the first non-lazy transaction that
@@ -83,35 +84,34 @@ pub(crate) struct ChironScheduler {
     // errors.
     aborted: AtomicBool,
 
-    pub(crate) default_channel: (channel::Sender<TxIdx>, channel::Receiver<TxIdx>),
+    pub(crate) default_channel: (flume::Sender<TxIdx>, flume::Receiver<TxIdx>),
 
-    pub(crate) priority_channel: (channel::Sender<TxIdx>, channel::Receiver<TxIdx>),
+    pub(crate) priority_channel: (flume::Sender<TxIdx>, flume::Receiver<TxIdx>),
 }
 
 impl ChironScheduler {
     pub(crate) fn new(block_size: usize, txs: &Vec<TxEnv>) -> Self {
-
-        let time = Instant::now();
-        let default_channel = channel::unbounded();
-        let priority_channel = channel::unbounded();
+        let default_channel = flume::unbounded();
+        let priority_channel = flume::unbounded();
 
         let mut res_map : FxHashMap<&AccessListItem, TxIdx> = FxHashMap::with_capacity_and_hasher(txs.len(), FxBuildHasher::default());
-        let mut parents: Vec<IntSet> = Vec::with_capacity(txs.len());
-        let mut children: Vec<IntSet> = Vec::with_capacity(txs.len());
+        let mut parents: Vec<Vec<usize>> = Vec::with_capacity(txs.len());
+        let mut children: Vec<Vec<usize>> = Vec::with_capacity(txs.len());
         for _ in 0..block_size
         {
-            parents.push(IntSet::default());
-            children.push(IntSet::default());
+            parents.push(Vec::default());
+            children.push(Vec::default());
         }
 
         for (idx, tx) in txs.iter().enumerate() {
-            let parent_set = vec_access!(parents, idx);
+            let parent_set = mut_vec_access!(parents, idx);
             for hint in &tx.access_list {
                 match res_map.entry(hint) {
                     Entry::Occupied(mut entry) => {
                         let parent = *entry.get();
-                        vec_access!(children, parent).insert(idx);
-                        parent_set.insert(parent);
+                        parent_set.push(parent);
+
+                        mut_vec_access!(children, parent).push(idx);
 
                         entry.insert(idx);
                     }
@@ -120,6 +120,9 @@ impl ChironScheduler {
                     }
                 }
             }
+            //if slowest_parent != TxIdx::MAX {
+            //    mut_vec_access!(children, slowest_parent).push(idx);
+            //}
         }
         
         for idx in 0..block_size {
@@ -134,14 +137,12 @@ impl ChironScheduler {
             }
         }
 
-        let passed2 = time.elapsed().as_millis();
-        // 3ms for 1000
-
+        // 1ms for 10k, 10ms for 50k
         Self {
             block_size,
             transactions_status: (0..block_size)
                 .map(|_| {
-                    Mutex::new(TxStatus {
+                    RwLock::new(TxStatus {
                         incarnation: 0,
                         status: IncarnationStatus::ReadyToExecute,
                     })
@@ -170,7 +171,7 @@ impl Scheduler for ChironScheduler {
 
     fn try_execute(&self, tx_idx: TxIdx) -> Option<TxVersion> {
         if tx_idx < self.block_size {
-            let mut tx = index_mutex!(self.transactions_status, tx_idx);
+            let mut tx = write_index_mutex!(self.transactions_status, tx_idx);
             if tx.status == IncarnationStatus::ReadyToExecute {
                 tx.status = IncarnationStatus::Executing;
                 return Some(TxVersion {
@@ -215,9 +216,9 @@ impl Scheduler for ChironScheduler {
             //todo do we need re-execute?
 
             // Check if we can do validation.
-            if self.transactions_status.get(validation_idx).unwrap().lock().unwrap().status == Executed {
+            if read_index_mutex!(self.transactions_status, validation_idx).status == Executed {
                 if validation_idx < self.block_size {
-                    let mut tx = index_mutex!(self.transactions_status, validation_idx);
+                    let mut tx = write_index_mutex!(self.transactions_status, validation_idx);
                     // "Steal" execution job while holding the lock
                     if tx.status == IncarnationStatus::ReadyToExecute {
                         tx.status = IncarnationStatus::Executing;
@@ -255,7 +256,7 @@ impl Scheduler for ChironScheduler {
     fn add_dependency(&self, tx_idx: TxIdx, blocking_tx_idx: TxIdx) -> bool {
         // This is an important lock to prevent a race condition where the blocking
         // transaction completes re-execution before this dependency can be added.
-        let blocking_tx = index_mutex!(self.transactions_status, blocking_tx_idx);
+        let blocking_tx = read_index_mutex!(self.transactions_status, blocking_tx_idx);
         if matches!(
             blocking_tx.status,
             IncarnationStatus::Executed | IncarnationStatus::Validated
@@ -263,18 +264,17 @@ impl Scheduler for ChironScheduler {
             return false;
         }
 
-        let mut tx = index_mutex!(self.transactions_status, tx_idx);
+        let mut tx = write_index_mutex!(self.transactions_status, tx_idx);
         debug_assert_eq!(tx.status, IncarnationStatus::Executing);
         tx.status = IncarnationStatus::Aborting;
 
         //let mut blocking_dependents = index_mutex!(self.transactions_dependents, blocking_tx_idx);
         //blocking_dependents.push(tx_idx);
         panic!("This should never happen. Transaction detected as dependent");
-        true
     }
 
     fn set_ready_status(&self, tx_idx: TxIdx) {
-        let mut tx = index_mutex!(self.transactions_status, tx_idx);
+        let mut tx = write_index_mutex!(self.transactions_status, tx_idx);
         debug_assert_eq!(tx.status, IncarnationStatus::Aborting);
         tx.status = IncarnationStatus::ReadyToExecute;
         tx.incarnation += 1;
@@ -285,21 +285,28 @@ impl Scheduler for ChironScheduler {
         tx_version: TxVersion,
         flags: FinishExecFlags,
     ) -> Option<Task> {
-        let mut tx = index_mutex!(self.transactions_status, tx_version.tx_idx);
+        let mut tx = write_index_mutex!(self.transactions_status, tx_version.tx_idx);
         debug_assert_eq!(tx.status, IncarnationStatus::Executing);
         debug_assert_eq!(tx.incarnation, tx_version.tx_incarnation);
 
         // Resume dependent transactions
+        if flags.contains(FinishExecFlags::NeedValidation) {
+            tx.status = IncarnationStatus::Executed;
+        } else {
+            tx.status = IncarnationStatus::Validated;
+            self.num_validated.fetch_add(1, Ordering::Relaxed);
+        }
+        drop(tx);
 
         let mut followup_tx = 0;
 
         // For all children
-        for child in self.transactions_dependents.get(tx_version.tx_idx).unwrap().iter() {
-            if self.transactions_status.get(*child).unwrap().lock().unwrap().status == ReadyToExecute {
+        for &child in vec_access!(self.transactions_dependents, tx_version.tx_idx) {
+            if read_index_mutex!(self.transactions_status, child).status == ReadyToExecute {
                 let mut can_schedule = true;
-                for parent in self.transactions_dependencies.get(*child).unwrap().iter() {
-                    if *parent != tx_version.tx_idx {
-                        let status = &self.transactions_status.get(*parent).unwrap().lock().unwrap().status;
+                for &parent in vec_access!(self.transactions_dependencies, child) {
+                    if parent != tx_version.tx_idx {
+                        let status = &read_index_mutex!(self.transactions_status, parent).status;
                         if *status != Executed && *status != Validated {
                             can_schedule = false;
                             break;
@@ -308,22 +315,15 @@ impl Scheduler for ChironScheduler {
                 }
 
                 if can_schedule {
-                    if self.transactions_dependents.get(*child).unwrap().is_empty() {
-                        self.default_channel.0.send(*child).unwrap();
+                    if self.transactions_dependents.get(child).unwrap().is_empty() {
+                        self.default_channel.0.send(child).unwrap();
                     } else if followup_tx == 0 {
-                        followup_tx = *child;
+                        followup_tx = child;
                     } else {
-                        self.priority_channel.0.send(*child).unwrap();
+                        self.priority_channel.0.send(child).unwrap();
                     }
                 }
             }
-        }
-
-        if flags.contains(FinishExecFlags::NeedValidation) {
-            tx.status = IncarnationStatus::Executed;
-        } else {
-            tx.status = IncarnationStatus::Validated;
-            self.num_validated.fetch_add(1, Ordering::Relaxed);
         }
 
         if followup_tx != 0 {
@@ -341,7 +341,7 @@ impl Scheduler for ChironScheduler {
     // for validation during [finish_validation]. The scheduler ensures that only
     // one failing validation per version can lead to a successful abort.
     fn try_validation_abort(&self, tx_version: &TxVersion) -> bool {
-        let mut tx = index_mutex!(self.transactions_status, tx_version.tx_idx);
+        let mut tx = write_index_mutex!(self.transactions_status, tx_version.tx_idx);
         if tx.status == IncarnationStatus::Validated {
             self.num_validated.fetch_sub(1, Ordering::Relaxed);
         }
@@ -364,12 +364,16 @@ impl Scheduler for ChironScheduler {
             self.set_ready_status(tx_version.tx_idx);
             self.validation_idx.fetch_add(1, Ordering::Relaxed);
         } else {
-            let mut tx = index_mutex!(self.transactions_status, tx_version.tx_idx);
+            let mut tx = write_index_mutex!(self.transactions_status, tx_version.tx_idx);
             if tx.status == IncarnationStatus::Executed {
                 tx.status = IncarnationStatus::Validated;
                 self.num_validated.fetch_add(1, Ordering::Relaxed);
             }
         }
         None
+    }
+
+    fn inc_exec(&self) {
+        //noop
     }
 }
