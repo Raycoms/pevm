@@ -75,11 +75,6 @@ pub(crate) struct ChironScheduler {
     transactions_dependencies: Vec<Vec<usize>>,
     // The next transaction to try and validate.
     validation_idx: AtomicUsize,
-    // We won't validate until we find the first non-lazy transaction that
-    // needs to read explicit values. We also skip the first transaction.
-    min_validation_idx: AtomicUsize,
-    // The number of validated transactions
-    num_validated: AtomicUsize,
     // True if the scheduler has been aborted, likely due to fatal execution
     // errors.
     aborted: AtomicBool,
@@ -152,13 +147,23 @@ impl ChironScheduler {
             transactions_dependencies: parents,
             // We won't validate until we find the first non-lazy transaction that
             // needs to read explicit values. We also skip the first transaction.
-            validation_idx: AtomicUsize::new(block_size),
-            min_validation_idx: AtomicUsize::new(block_size),
-            num_validated: AtomicUsize::new(0),
+            validation_idx: AtomicUsize::new(0),
             aborted: AtomicBool::new(false),
             default_channel,
             priority_channel
         }
+    }
+
+    fn can_schedule(&self, child: usize, parent_idx: usize) -> bool {
+        for &parent in vec_access!(self.transactions_dependencies, child) {
+            if parent != parent_idx {
+                let status = &read_index_mutex!(self.transactions_status, parent).status;
+                if *status != Executed && *status != Validated {
+                    return false;
+                }
+            }
+        }
+        true
     }
 }
 
@@ -205,46 +210,22 @@ impl Scheduler for ChironScheduler {
             // Check if we finished and can stop execution.
             let validation_idx = self.validation_idx.load(Ordering::Relaxed);
             if validation_idx >= self.block_size {
-                if self.num_validated.load(Ordering::Relaxed) >= self.block_size - self.min_validation_idx.load(Ordering::Relaxed)
-                {
-                    break;
-                }
-                thread::yield_now();
-                continue;
+               break;
             }
 
             //todo do we need re-execute?
 
+            let tx = read_index_mutex!(self.transactions_status, validation_idx);
             // Check if we can do validation.
-            if read_index_mutex!(self.transactions_status, validation_idx).status == Executed {
-                if validation_idx < self.block_size {
-                    let mut tx = write_index_mutex!(self.transactions_status, validation_idx);
-                    // "Steal" execution job while holding the lock
-                    if tx.status == IncarnationStatus::ReadyToExecute {
-                        tx.status = IncarnationStatus::Executing;
-                        return Some(Task::Execution(TxVersion {
-                            tx_idx: validation_idx,
-                            tx_incarnation: tx.incarnation,
-                        }));
-                    }
-                    // Start a typical validation task
-                    if matches!(tx.status,IncarnationStatus::Executed | IncarnationStatus::Validated) {
-                        return Some(Task::Validation(TxVersion {
-                            tx_idx: validation_idx,
-                            tx_incarnation: tx.incarnation,
-                        }));
-                    }
-                    // Validation index is still catching up so continue a
-                    // new loop iteration to refetch the latest indices
-                    // before deciding again.
-                    if tx.status == IncarnationStatus::Aborting {
-                        continue;
-                    }
-                    // Fall back to execution job as this executing tx will
-                    // decide if validation is needed when it's done. If it
-                    // does, all validation tasks here would be redone anyway.
-                }
+            if tx.status == Executed {
+                // Start a typical validation task
+                self.validation_idx.store(validation_idx + 1, Ordering::Relaxed);
+                return Some(Task::Validation(TxVersion {
+                    tx_idx: validation_idx,
+                    tx_incarnation: tx.incarnation,
+                }));
             }
+            thread::yield_now();
         }
         None
     }
@@ -294,7 +275,6 @@ impl Scheduler for ChironScheduler {
             tx.status = IncarnationStatus::Executed;
         } else {
             tx.status = IncarnationStatus::Validated;
-            self.num_validated.fetch_add(1, Ordering::Relaxed);
         }
         drop(tx);
 
@@ -303,18 +283,7 @@ impl Scheduler for ChironScheduler {
         // For all children
         for &child in vec_access!(self.transactions_dependents, tx_version.tx_idx) {
             if read_index_mutex!(self.transactions_status, child).status == ReadyToExecute {
-                let mut can_schedule = true;
-                for &parent in vec_access!(self.transactions_dependencies, child) {
-                    if parent != tx_version.tx_idx {
-                        let status = &read_index_mutex!(self.transactions_status, parent).status;
-                        if *status != Executed && *status != Validated {
-                            can_schedule = false;
-                            break;
-                        }
-                    }
-                }
-
-                if can_schedule {
+                if self.can_schedule(child, tx_version.tx_idx) {
                     if self.transactions_dependents.get(child).unwrap().is_empty() {
                         self.default_channel.0.send(child).unwrap();
                     } else if followup_tx == 0 {
@@ -325,6 +294,7 @@ impl Scheduler for ChironScheduler {
                 }
             }
         }
+        // We might be double scheduling in here!
 
         if followup_tx != 0 {
             let version = self.try_execute(followup_tx);
@@ -342,10 +312,6 @@ impl Scheduler for ChironScheduler {
     // one failing validation per version can lead to a successful abort.
     fn try_validation_abort(&self, tx_version: &TxVersion) -> bool {
         let mut tx = write_index_mutex!(self.transactions_status, tx_version.tx_idx);
-        if tx.status == IncarnationStatus::Validated {
-            self.num_validated.fetch_sub(1, Ordering::Relaxed);
-        }
-
         let aborting = matches!(
             tx.status,
             IncarnationStatus::Executed | IncarnationStatus::Validated
@@ -362,18 +328,12 @@ impl Scheduler for ChironScheduler {
     fn finish_validation(&self, tx_version: &TxVersion, aborted: bool) -> Option<Task> {
         if aborted {
             self.set_ready_status(tx_version.tx_idx);
-            self.validation_idx.fetch_add(1, Ordering::Relaxed);
         } else {
             let mut tx = write_index_mutex!(self.transactions_status, tx_version.tx_idx);
             if tx.status == IncarnationStatus::Executed {
                 tx.status = IncarnationStatus::Validated;
-                self.num_validated.fetch_add(1, Ordering::Relaxed);
             }
         }
         None
-    }
-
-    fn inc_exec(&self) {
-        //noop
     }
 }

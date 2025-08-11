@@ -8,6 +8,9 @@ pub mod common;
 #[path = "./mod.rs"]
 pub mod erc20;
 
+#[path = "../data/p2p.rs"]
+pub mod p2p;
+
 use common::test_execute_revm;
 use erc20::generate_cluster;
 use pevm::chain::PevmEthereum;

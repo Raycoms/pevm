@@ -124,7 +124,6 @@ pub fn generate_chiron_cluster(
         let recipient = families[p2p_receiver_distribution.sample(&mut rng) % families.len()];
         let calldata = ERC20Token::transfer(recipient, U256::from(rand::random::<u8>()));
         let person = families[p2p_sender_distribution.sample(&mut rng) % families.len()];
-        //todo sth still fails sometimes with certain workloads and it gets stuck! Probably the handover to check if its finished is slightly undeterministic and there is a chance to bypass
         let nonce = sender_map.get(&person).unwrap_or(&0);
 
         txs.push(TxEnv {

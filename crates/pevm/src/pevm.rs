@@ -397,7 +397,7 @@ impl Pevm {
         loop {
             return match vm.execute(&tx_version) {
                 Err(VmExecutionError::Retry) => {
-                    scheduler.inc_exec();
+
                     if self.abort_reason.get().is_none() {
                         continue;
                     }
@@ -410,7 +410,6 @@ impl Pevm {
                     None
                 }
                 Err(VmExecutionError::Blocking(blocking_tx_idx)) => {
-                    scheduler.inc_exec();
                     if !scheduler.add_dependency(tx_version.tx_idx, blocking_tx_idx)
                         && self.abort_reason.get().is_none()
                     {
@@ -421,8 +420,8 @@ impl Pevm {
                     None
                 }
                 Err(VmExecutionError::ExecutionError(err)) => {
-                    scheduler.inc_exec();
                     scheduler.abort();
+
                     self.abort_reason
                         .get_or_init(|| AbortReason::ExecutionError(err));
                     None
