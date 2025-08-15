@@ -5,7 +5,7 @@ use std::{
     thread,
 };
 use std::collections::hash_map::Entry;
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 use revm::primitives::{AccessListItem, TxEnv};
 use rustc_hash::{FxBuildHasher, FxHashMap};
 use crate::{FinishExecFlags, IncarnationStatus, Task, TxIdx, TxStatus, TxVersion};
@@ -79,6 +79,8 @@ pub(crate) struct ChironScheduler {
     // errors.
     aborted: AtomicBool,
 
+    val_lock: Mutex<bool>,
+
     pub(crate) default_channel: (flume::Sender<TxIdx>, flume::Receiver<TxIdx>),
 
     pub(crate) priority_channel: (flume::Sender<TxIdx>, flume::Receiver<TxIdx>),
@@ -149,6 +151,7 @@ impl ChironScheduler {
             // needs to read explicit values. We also skip the first transaction.
             validation_idx: AtomicUsize::new(0),
             aborted: AtomicBool::new(false),
+            val_lock: Mutex::new(true),
             default_channel,
             priority_channel
         }
@@ -164,6 +167,21 @@ impl ChironScheduler {
             }
         }
         true
+    }
+
+    fn try_validate(&self, tx_idx: TxIdx) -> Option<TxVersion> {
+        //todo still sometimes gets stuck
+        if let Ok(ref mut mutex) = self.val_lock.try_lock() {
+            let mut tx = write_index_mutex!(self.transactions_status, tx_idx);
+            if tx.status == IncarnationStatus::Executed {
+                self.validation_idx.fetch_add(1, Ordering::Relaxed);
+                return Some(TxVersion {
+                    tx_idx,
+                    tx_incarnation: tx.incarnation,
+                });
+            }
+        }
+        None
     }
 }
 
@@ -210,22 +228,12 @@ impl Scheduler for ChironScheduler {
             // Check if we finished and can stop execution.
             let validation_idx = self.validation_idx.load(Ordering::Relaxed);
             if validation_idx >= self.block_size {
-               break;
+                break;
             }
 
-            //todo do we need re-execute?
-
-            let tx = read_index_mutex!(self.transactions_status, validation_idx);
-            // Check if we can do validation.
-            if tx.status == Executed {
-                // Start a typical validation task
-                self.validation_idx.store(validation_idx + 1, Ordering::Relaxed);
-                return Some(Task::Validation(TxVersion {
-                    tx_idx: validation_idx,
-                    tx_incarnation: tx.incarnation,
-                }));
+            if let Some(tx_version) = self.try_validate(validation_idx) {
+                return Some(Task::Validation(tx_version));
             }
-            thread::yield_now();
         }
         None
     }

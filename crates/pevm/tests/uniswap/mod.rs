@@ -5,8 +5,9 @@ pub mod contract;
 
 use alloy_rpc_types_eth::AccessListItem;
 use rand::prelude::ThreadRng;
-use rand::{thread_rng};
+use rand::{thread_rng, Rng, RngCore, SeedableRng};
 use rand::distributions::{Distribution, WeightedIndex};
+use rand::rngs::StdRng;
 use crate::erc20::contract::ERC20Token;
 use contract::{SingleSwap, SwapRouter, UniswapV3Factory, UniswapV3Pool, WETH9};
 use pevm::{Bytecodes, ChainState, EvmAccount};
@@ -196,11 +197,19 @@ pub fn generate_trading_history(
 ) -> (ChainState, Bytecodes, Vec<TxEnv>) {
     let uniswap_distribution: WeightedIndex<f64> = WeightedIndex::new(&BURSTY).unwrap();
 
+    let mut origin_rng: ThreadRng = thread_rng();
+
+    let seed = origin_rng.next_u64();
+
+    let mut rng = StdRng::seed_from_u64(seed);
+
+    println!("seed {}", seed);
+
     // 0.0714 ms atm per uniswap trade. This seems little?
 
     let mut pairs = Vec::new();
     for _ in 0..BURSTY.len() {
-        pairs.push((Address::new(rand::random()), Address::new(rand::random())));
+        pairs.push((Address::new(rng.gen()), Address::new(rng.gen())));
     }
 
     let pool_init_code_hash = B256::from([
@@ -210,14 +219,14 @@ pub fn generate_trading_history(
         0xde, 0xad, 0xbe, 0xef, 0x00, 0x00, 0x00, 0x00,
     ]);
 
-    let swap_router_address = Address::new(rand::random());
-    let weth9_address = Address::new(rand::random());
-    let owner = Address::new(rand::random());
-    let factory_address = Address::new(rand::random());
-    let nonfungible_position_manager_address = Address::new(rand::random());
+    let swap_router_address = Address::new(rng.gen());
+    let weth9_address = Address::new(rng.gen());
+    let owner = Address::new(rng.gen());
+    let factory_address = Address::new(rng.gen());
+    let nonfungible_position_manager_address = Address::new(rng.gen());
 
     let people_addresses: Vec<Address> = (0..block_size)
-        .map(|_| Address::new(rand::random()))
+        .map(|_| Address::new(rng.gen()))
         .collect();
 
     let mut factory_account = UniswapV3Factory::new(owner);
@@ -230,7 +239,7 @@ pub fn generate_trading_history(
         let pool_address = UniswapV3Pool::new(*coin1, *coin2, factory_address)
             .get_address(factory_address, pool_init_code_hash);
 
-        let single_swap_address = Address::new(rand::random());
+        let single_swap_address = Address::new(rng.gen());
 
         let dai_account = ERC20Token::new(&coin1.to_string()[0..16], &coin1.to_string()[0..16], 18, 222_222_000_000_000_000_000_000u128)
             .add_balances(&[pool_address], uint!(111_111_000_000_000_000_000_000_U256))
@@ -311,8 +320,6 @@ pub fn generate_trading_history(
     }
 
     let mut txs = Vec::new();
-
-    let mut rng: ThreadRng = thread_rng();
 
     // sellToken0(uint256): c92b0891
     // sellToken1(uint256): 6b055260
