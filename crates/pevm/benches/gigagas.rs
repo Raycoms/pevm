@@ -42,52 +42,54 @@ const GIGA_GAS: u64 = 1_000_000_000;
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 /// Runs a benchmark for executing a set of transactions on a given blockchain state.
-pub fn bench(c: &mut Criterion, name: &str, storage: InMemoryStorage, txs: Vec<TxEnv>, cores: usize) {
-    let concurrency_level = NonZeroUsize::new(cores).unwrap();
-    let chain = PevmEthereum::mainnet();
-    let spec_id = SpecId::LATEST;
-    let block_env = BlockEnv::default();
-    let mut pevm = Pevm::default();
-    let mut group = c.benchmark_group(name);
+pub fn bench(c: &mut Criterion, name: &str, storage: InMemoryStorage, txs: Vec<TxEnv>) {
+    for cores in [2,4,8,16,32] {
+        let concurrency_level = NonZeroUsize::new(cores).unwrap();
+        let chain = PevmEthereum::mainnet();
+        let spec_id = SpecId::LATEST;
+        let block_env = BlockEnv::default();
+        let mut pevm = Pevm::default();
+        let mut group = c.benchmark_group(name);
 
-    group.bench_function("Sequential", |b| {
-        b.iter(|| {
-            execute_revm_sequential(
-                black_box(&chain),
-                black_box(&storage),
-                black_box(spec_id),
-                black_box(block_env.clone()),
-                black_box(txs.clone()),
-            )
-        })
-    });
-    group.bench_function("Parallel BlockSTM", |b| {
-        b.iter(|| {
-            pevm.execute_revm_parallel(
-                black_box(&chain),
-                black_box(&storage),
-                black_box(spec_id),
-                black_box(block_env.clone()),
-                black_box(txs.clone()),
-                black_box(concurrency_level),
-                true
-            )
-        })
-    });
-    group.bench_function("Parallel Chiron", |b| {
-        b.iter(|| {
-            pevm.execute_revm_parallel(
-                black_box(&chain),
-                black_box(&storage),
-                black_box(spec_id),
-                black_box(block_env.clone()),
-                black_box(txs.clone()),
-                black_box(concurrency_level),
-                false
-            )
-        })
-    });
-    group.finish();
+        group.bench_function(&format!("Sequential {}", cores), |b| {
+            b.iter(|| {
+                execute_revm_sequential(
+                    black_box(&chain),
+                    black_box(&storage),
+                    black_box(spec_id),
+                    black_box(block_env.clone()),
+                    black_box(txs.clone()),
+                )
+            })
+        });
+        group.bench_function(&format!("Parallel BlockSTM {}", cores), |b| {
+            b.iter(|| {
+                pevm.execute_revm_parallel(
+                    black_box(&chain),
+                    black_box(&storage),
+                    black_box(spec_id),
+                    black_box(block_env.clone()),
+                    black_box(txs.clone()),
+                    black_box(concurrency_level),
+                    true
+                )
+            })
+        });
+        group.bench_function(&format!("Parallel Chiron {}", cores), |b| {
+            b.iter(|| {
+                pevm.execute_revm_parallel(
+                    black_box(&chain),
+                    black_box(&storage),
+                    black_box(spec_id),
+                    black_box(block_env.clone()),
+                    black_box(txs.clone()),
+                    black_box(concurrency_level),
+                    false
+                )
+            })
+        });
+        group.finish();
+    }
 }
 
 /*
@@ -157,8 +159,7 @@ pub fn bench_raw_transfers(c: &mut Criterion) {
                     ..TxEnv::default()
                 }
             })
-            .collect::<Vec<_>>(),
-        8
+            .collect::<Vec<_>>()
     );
 }
 
@@ -171,26 +172,25 @@ pub fn bench_erc20(c: &mut Criterion) {
         c,
         "Independent ERC20",
         InMemoryStorage::new(state, Arc::new(bytecodes), Default::default()),
-        txs,8
+        txs
     );
 }
 
 /// Benchmark the execution time of erc20 transactions.
-pub fn chiron_bench_erc20(c: &mut Criterion, cores: usize) {
+pub fn chiron_bench_erc20(c: &mut Criterion) {
     let block_size = 10_000;
     let (mut state, bytecodes, txs) = erc20::generate_chiron_cluster(block_size);
     state.insert(Address::ZERO, EvmAccount::default()); // Beneficiary
     bench(
         c,
-        format!("Chiron ERC20: {} cores", cores).as_str(),
+        format!("Chiron ERC20:").as_str(),
         InMemoryStorage::new(state, Arc::new(bytecodes), Default::default()),
-        txs,
-        cores
+        txs
     );
 }
 
 /// Benchmarks the execution time of Uniswap V3 swap transactions.
-pub fn chiron_bench_uniswap(c: &mut Criterion, cores : usize, bursty: bool) {
+pub fn chiron_bench_uniswap(c: &mut Criterion, bursty: bool) {
     let block_size = 10_000;
     let mut final_state = ChainState::from_iter([(Address::ZERO, EvmAccount::default())]); // Beneficiary
 
@@ -211,10 +211,9 @@ pub fn chiron_bench_uniswap(c: &mut Criterion, cores : usize, bursty: bool) {
 
     bench(
         c,
-        format!("Chiron Uniswap: {} cores {} bursty", cores, load_type).as_str(),
+        format!("Chiron Uniswap: {} bursty", load_type).as_str(),
         InMemoryStorage::new(final_state, Arc::new(final_bytecodes), Default::default()),
-        final_txs,
-        cores
+        final_txs
     );
 }
 
@@ -234,8 +233,7 @@ pub fn bench_uniswap(c: &mut Criterion) {
         c,
         "Independent Uniswap",
         InMemoryStorage::new(final_state, Arc::new(final_bytecodes), Default::default()),
-        final_txs,
-        8
+        final_txs
     );
 }
 
@@ -249,11 +247,9 @@ pub fn benchmark_gigagas(c: &mut Criterion) {
     // They all seem to come from executiom, not from validation though, which is weird.
     //chiron_bench_erc20(c);
 
-    for cores in [2,4,8,16,32] {
-        chiron_bench_erc20(c, cores);
-        chiron_bench_uniswap(c, cores, true);
-        chiron_bench_uniswap(c, cores, false);
-    }
+    chiron_bench_erc20(c);
+    chiron_bench_uniswap(c, true);
+    chiron_bench_uniswap(c, false);
 }
 
 // HACK: we can't document public items inside of the macro
