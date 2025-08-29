@@ -15,6 +15,7 @@ use pevm::{
 };
 use revm::primitives::{AccessListItem, BlockEnv, SpecId, TransactTo, TxEnv};
 use crate::p2p::{TX_FROM, TX_TO};
+use crate::uniswap::AVG;
 // Better project structure
 
 /// common module
@@ -41,8 +42,8 @@ const GIGA_GAS: u64 = 1_000_000_000;
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 /// Runs a benchmark for executing a set of transactions on a given blockchain state.
-pub fn bench(c: &mut Criterion, name: &str, storage: InMemoryStorage, txs: Vec<TxEnv>) {
-    let concurrency_level = NonZeroUsize::new(8).unwrap();
+pub fn bench(c: &mut Criterion, name: &str, storage: InMemoryStorage, txs: Vec<TxEnv>, cores: usize) {
+    let concurrency_level = NonZeroUsize::new(cores).unwrap();
     let chain = PevmEthereum::mainnet();
     let spec_id = SpecId::LATEST;
     let block_env = BlockEnv::default();
@@ -157,6 +158,7 @@ pub fn bench_raw_transfers(c: &mut Criterion) {
                 }
             })
             .collect::<Vec<_>>(),
+        8
     );
 }
 
@@ -169,41 +171,50 @@ pub fn bench_erc20(c: &mut Criterion) {
         c,
         "Independent ERC20",
         InMemoryStorage::new(state, Arc::new(bytecodes), Default::default()),
-        txs,
+        txs,8
     );
 }
 
 /// Benchmark the execution time of erc20 transactions.
-pub fn chiron_bench_erc20(c: &mut Criterion) {
+pub fn chiron_bench_erc20(c: &mut Criterion, cores: usize) {
     let block_size = 10_000;
     let (mut state, bytecodes, txs) = erc20::generate_chiron_cluster(block_size);
     state.insert(Address::ZERO, EvmAccount::default()); // Beneficiary
     bench(
         c,
-        "Chiron ERC20",
+        format!("Chiron ERC20: {} cores", cores).as_str(),
         InMemoryStorage::new(state, Arc::new(bytecodes), Default::default()),
         txs,
+        cores
     );
 }
 
 /// Benchmarks the execution time of Uniswap V3 swap transactions.
-pub fn chiron_bench_uniswap(c: &mut Criterion) {
+pub fn chiron_bench_uniswap(c: &mut Criterion, cores : usize, bursty: bool) {
     let block_size = 10_000;
     let mut final_state = ChainState::from_iter([(Address::ZERO, EvmAccount::default())]); // Beneficiary
 
     let mut final_bytecodes = Bytecodes::default();
     let mut final_txs = Vec::<TxEnv>::new();
 
-    let (state, bytecodes, txs) = uniswap::generate_trading_history(block_size);
+    let (state, bytecodes, txs) = uniswap::generate_trading_history(block_size, bursty);
     final_state.extend(state);
     final_bytecodes.extend(bytecodes);
     final_txs.extend(txs);
 
+    let load_type;
+    if bursty {
+        load_type = "bursty";
+    } else {
+        load_type = "avg";
+    }
+
     bench(
         c,
-        "Contended Uniswap",
+        format!("Chiron Uniswap: {} cores {} bursty", cores, load_type).as_str(),
         InMemoryStorage::new(final_state, Arc::new(final_bytecodes), Default::default()),
         final_txs,
+        cores
     );
 }
 
@@ -224,6 +235,7 @@ pub fn bench_uniswap(c: &mut Criterion) {
         "Independent Uniswap",
         InMemoryStorage::new(final_state, Arc::new(final_bytecodes), Default::default()),
         final_txs,
+        8
     );
 }
 
@@ -235,8 +247,13 @@ pub fn benchmark_gigagas(c: &mut Criterion) {
 
     // The erc bench has around 1600/10k re-executions. Not that much, not that little.
     // They all seem to come from executiom, not from validation though, which is weird.
-    chiron_bench_erc20(c);
-    chiron_bench_uniswap(c);
+    //chiron_bench_erc20(c);
+
+    for cores in [2,4,8,16,32] {
+        chiron_bench_erc20(c, cores);
+        chiron_bench_uniswap(c, cores, true);
+        chiron_bench_uniswap(c, cores, false);
+    }
 }
 
 // HACK: we can't document public items inside of the macro

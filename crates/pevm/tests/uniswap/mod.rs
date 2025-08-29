@@ -193,9 +193,18 @@ pub fn generate_cluster(
 
 /// Generates an uniswap trade for a specific trade pair.
 pub fn generate_trading_history(
-    block_size: usize
+    block_size: usize,
+    bursty: bool
 ) -> (ChainState, Bytecodes, Vec<TxEnv>) {
-    let uniswap_distribution: WeightedIndex<f64> = WeightedIndex::new(&BURSTY).unwrap();
+
+    let benchmark_collection : &[f64];
+    if bursty {
+        benchmark_collection = &BURSTY;
+    } else {
+        benchmark_collection = &AVG;
+    }
+
+    let uniswap_distribution: WeightedIndex<f64> = WeightedIndex::new(benchmark_collection).unwrap();
 
     let mut origin_rng: ThreadRng = thread_rng();
 
@@ -208,7 +217,7 @@ pub fn generate_trading_history(
     // 0.0714 ms atm per uniswap trade. This seems little?
 
     let mut pairs = Vec::new();
-    for _ in 0..BURSTY.len() {
+    for _ in 0..benchmark_collection.len() {
         pairs.push((Address::new(rng.gen()), Address::new(rng.gen())));
     }
 

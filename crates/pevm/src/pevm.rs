@@ -261,6 +261,9 @@ impl Pevm {
             fully_evaluated_results.push(execution_result);
         }
 
+        //println!("{:?}", fully_evaluated_results.get(0).unwrap());
+        //println!("{:?}", fully_evaluated_results.get(fully_evaluated_results.len() - 1).unwrap());
+
         // We fully evaluate (the balance and nonce of) the beneficiary account
         // and raw transfer recipients that may have been atomically updated.
         for address in mv_memory.consume_lazy_addresses() {
@@ -485,5 +488,10 @@ pub fn execute_revm_sequential<S: Storage, C: PevmChain>(
 
         results.push(execution_result);
     }
+
+    //println!("{:?}", results.get(0).unwrap());
+    //println!("{:?}", results.get(results.len() - 1).unwrap());
+
+
     Ok(results)
 }
