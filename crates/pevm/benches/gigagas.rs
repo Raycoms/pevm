@@ -43,7 +43,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 /// Runs a benchmark for executing a set of transactions on a given blockchain state.
 pub fn bench(c: &mut Criterion, name: &str, storage: InMemoryStorage, txs: Vec<TxEnv>) {
-    for cores in [2,4,8,16,32] {
+    for cores in [2,4,6,8,10,12,14,16,18,20] {
         let concurrency_level = NonZeroUsize::new(cores).unwrap();
         let chain = PevmEthereum::mainnet();
         let spec_id = SpecId::LATEST;
