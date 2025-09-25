@@ -1,15 +1,13 @@
 use std::{
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-    },
-    thread,
+    }
 };
 use std::collections::hash_map::Entry;
-use std::sync::{Mutex, RwLock};
+use std::sync::{Mutex, RwLock, TryLockResult};
 use revm::primitives::{AccessListItem, TxEnv};
 use rustc_hash::{FxBuildHasher, FxHashMap};
 use crate::{FinishExecFlags, IncarnationStatus, Task, TxIdx, TxStatus, TxVersion};
-use crate::IncarnationStatus::{Executed, ReadyToExecute, Validated};
 use crate::scheduler::Scheduler;
 
 // This optimization is desired as we constantly index into many
@@ -67,12 +65,6 @@ pub(crate) struct ChironScheduler {
     // TODO: Consider packing [TxStatus]s into atomics instead of
     // [Mutex] given how small they are.
     transactions_status: Vec<RwLock<TxStatus>>,
-    // The list of dependent transactions to queue for execution when the
-    // key transaction finished executing.
-    transactions_dependents: Vec<Vec<usize>>,
-    // The list of dependency transactions to wait for before
-    // key transaction is executed.
-    transactions_dependencies: Vec<Vec<usize>>,
     // The next transaction to try and validate.
     validation_idx: AtomicUsize,
     // True if the scheduler has been aborted, likely due to fatal execution
@@ -84,55 +76,80 @@ pub(crate) struct ChironScheduler {
     pub(crate) default_channel: (flume::Sender<TxIdx>, flume::Receiver<TxIdx>),
 
     pub(crate) priority_channel: (flume::Sender<TxIdx>, flume::Receiver<TxIdx>),
+
+    pub critical_path_parent: Vec<boxcar::Vec<usize>>,
+
+    pub children: Vec<Vec<TxIdx>>,
+
+    pub parents: Vec<Vec<u16>>,
 }
 
 impl ChironScheduler {
     pub(crate) fn new(block_size: usize, txs: &Vec<TxEnv>) -> Self {
+        let now = std::time::Instant::now();
         let default_channel = flume::unbounded();
         let priority_channel = flume::unbounded();
 
-        let mut res_map : FxHashMap<&AccessListItem, TxIdx> = FxHashMap::with_capacity_and_hasher(txs.len(), FxBuildHasher::default());
-        let mut parents: Vec<Vec<usize>> = Vec::with_capacity(txs.len());
-        let mut children: Vec<Vec<usize>> = Vec::with_capacity(txs.len());
-        for _ in 0..block_size
-        {
-            parents.push(Vec::default());
-            children.push(Vec::default());
-        }
+        let mut parents: Vec<Vec<u16>> = (0..block_size).map(|_|{Vec::new()}).collect();
 
-        for (idx, tx) in txs.iter().enumerate() {
-            let parent_set = mut_vec_access!(parents, idx);
-            for hint in &tx.access_list {
+        let mut res_map : FxHashMap<&AccessListItem, (TxIdx, u32)> = FxHashMap::with_capacity_and_hasher(txs.len(), FxBuildHasher::default());
+
+        let mut children: Vec<Vec<TxIdx>> = (0..block_size).map(|_|{Vec::new()}).collect();
+        let critical_path_parent: Vec<boxcar::Vec<usize>> = (0..block_size).map(|_|boxcar::Vec::new()).collect();
+
+        let mut send_vec = vec![];
+
+        for i in 0..block_size {
+            let mut critical_parent_cost = 0;
+            let mut critical_parent = usize::MAX;
+            for hint in &*txs[i].access_list {
                 match res_map.entry(hint) {
-                    Entry::Occupied(mut entry) => {
-                        let parent = *entry.get();
-                        parent_set.push(parent);
-
-                        mut_vec_access!(children, parent).push(idx);
-
-                        entry.insert(idx);
+                    Entry::Occupied(entry) => {
+                        if entry.get().1 > critical_parent_cost {
+                            critical_parent_cost = entry.get().1;
+                            critical_parent = entry.get().0;
+                        }
+                        if !children[entry.get().0].contains(&i) {
+                            children[entry.get().0].push(i);
+                            parents[i].push(entry.get().0 as u16);
+                        }
                     }
                     Entry::Vacant(entry) => {
-                        entry.insert(idx);
+                        // Do nothing
                     }
                 }
             }
-            //if slowest_parent != TxIdx::MAX {
-            //    mut_vec_access!(children, slowest_parent).push(idx);
-            //}
-        }
-        
-        for idx in 0..block_size {
-            let local_parents = parents.get(idx).unwrap();
-            let local_children = children.get(idx).unwrap();
-            if local_parents.is_empty() {
-                if local_children.is_empty() {
-                    default_channel.0.send(idx).unwrap();
-                } else {
-                    priority_channel.0.send(idx).unwrap();
+
+            for hint in &*txs[i].access_list {
+                match res_map.entry(hint) {
+                    Entry::Occupied(mut entry) => {
+                        entry.insert((i, critical_parent_cost + txs[i].gas_limit as u32));
+                    }
+                    Entry::Vacant(entry) => {
+                        entry.insert((i, critical_parent_cost + txs[i].gas_limit as u32));
+                    }
                 }
             }
+
+            if critical_parent == usize::MAX {
+                send_vec.push(i);
+            }
+            else {
+                critical_path_parent[critical_parent].push(i);
+            }
         }
+
+        for i in send_vec {
+            if children[i].is_empty() {
+                let _ = default_channel.0.send(i);
+            }
+            else {
+                let _ = priority_channel.0.send(i);
+            }
+        }
+
+        // 3-4ms atm
+        // println!("took {}", now.elapsed().as_millis());
 
         // 1ms for 10k, 10ms for 50k
         Self {
@@ -145,40 +162,31 @@ impl ChironScheduler {
                     })
                 })
                 .collect(),
-            transactions_dependents: children,
-            transactions_dependencies: parents,
             // We won't validate until we find the first non-lazy transaction that
             // needs to read explicit values. We also skip the first transaction.
             validation_idx: AtomicUsize::new(0),
             aborted: AtomicBool::new(false),
             val_lock: Mutex::new(true),
             default_channel,
-            priority_channel
+            priority_channel,
+            children,
+            critical_path_parent,
+            parents
         }
     }
 
-    fn can_schedule(&self, child: usize, parent_idx: usize) -> bool {
-        for &parent in vec_access!(self.transactions_dependencies, child) {
-            if parent != parent_idx {
-                let status = &read_index_mutex!(self.transactions_status, parent).status;
-                if *status != Executed && *status != Validated {
-                    return false;
+    fn try_validate(&self) -> Option<TxVersion> {
+        if let Ok(_) = self.val_lock.try_lock() {
+            let tx_idx = self.validation_idx.load(Ordering::Relaxed);
+            if tx_idx < self.block_size {
+                let tx = read_index_mutex!(self.transactions_status, tx_idx);
+                if tx.status == IncarnationStatus::Executed {
+                    self.validation_idx.fetch_add(1, Ordering::Relaxed);
+                    return Some(TxVersion {
+                        tx_idx,
+                        tx_incarnation: tx.incarnation,
+                    });
                 }
-            }
-        }
-        true
-    }
-
-    fn try_validate(&self, tx_idx: TxIdx) -> Option<TxVersion> {
-        //todo still sometimes gets stuck
-        if let Ok(ref mut mutex) = self.val_lock.try_lock() {
-            let mut tx = write_index_mutex!(self.transactions_status, tx_idx);
-            if tx.status == IncarnationStatus::Executed {
-                self.validation_idx.fetch_add(1, Ordering::Relaxed);
-                return Some(TxVersion {
-                    tx_idx,
-                    tx_incarnation: tx.incarnation,
-                });
             }
         }
         None
@@ -194,8 +202,17 @@ impl Scheduler for ChironScheduler {
 
     fn try_execute(&self, tx_idx: TxIdx) -> Option<TxVersion> {
         if tx_idx < self.block_size {
-            let mut tx = write_index_mutex!(self.transactions_status, tx_idx);
-            if tx.status == IncarnationStatus::ReadyToExecute {
+            if read_index_mutex!(self.transactions_status, tx_idx).status == IncarnationStatus::ReadyToExecute {
+                for parent in self.parents[tx_idx].iter() {
+                    let usize_dep = *parent as usize;
+                    let status = &read_index_mutex!(self.transactions_status, usize_dep).status;
+                    if *status != IncarnationStatus::Executed && *status != IncarnationStatus::Validated {
+                        self.critical_path_parent[usize_dep].push(tx_idx);
+                        return None;
+                    }
+                }
+
+                let mut tx = write_index_mutex!(self.transactions_status, tx_idx);
                 tx.status = IncarnationStatus::Executing;
                 return Some(TxVersion {
                     tx_idx,
@@ -231,9 +248,10 @@ impl Scheduler for ChironScheduler {
                 break;
             }
 
-            if let Some(tx_version) = self.try_validate(validation_idx) {
+            if let Some(tx_version) = self.try_validate() {
                 return Some(Task::Validation(tx_version));
             }
+            //return Some(Task::SigVerification(validation_idx))
         }
         None
     }
@@ -274,44 +292,41 @@ impl Scheduler for ChironScheduler {
         tx_version: TxVersion,
         flags: FinishExecFlags,
     ) -> Option<Task> {
-        let mut tx = write_index_mutex!(self.transactions_status, tx_version.tx_idx);
-        debug_assert_eq!(tx.status, IncarnationStatus::Executing);
-        debug_assert_eq!(tx.incarnation, tx_version.tx_incarnation);
+        {
+            let mut tx = write_index_mutex!(self.transactions_status, tx_version.tx_idx);
+            debug_assert_eq!(tx.status, IncarnationStatus::Executing);
+            debug_assert_eq!(tx.incarnation, tx_version.tx_incarnation);
 
-        // Resume dependent transactions
-        if flags.contains(FinishExecFlags::NeedValidation) {
-            tx.status = IncarnationStatus::Executed;
-        } else {
-            tx.status = IncarnationStatus::Validated;
+            // Resume dependent transactions
+            if flags.contains(FinishExecFlags::NeedValidation) {
+                tx.status = IncarnationStatus::Executed;
+            } else {
+                tx.status = IncarnationStatus::Validated;
+            }
         }
-        drop(tx);
 
-        let mut followup_tx = 0;
-
-        // For all children
-        for &child in vec_access!(self.transactions_dependents, tx_version.tx_idx) {
-            if read_index_mutex!(self.transactions_status, child).status == ReadyToExecute {
-                if self.can_schedule(child, tx_version.tx_idx) {
-                    if self.transactions_dependents.get(child).unwrap().is_empty() {
-                        self.default_channel.0.send(child).unwrap();
-                    } else if followup_tx == 0 {
-                        followup_tx = child;
+        let mut got_next = false;
+        let mut next = None;
+        {
+            // For all critical children
+            for i in 0..self.critical_path_parent[tx_version.tx_idx].count() {
+                let tx = self.critical_path_parent[tx_version.tx_idx][i];
+                if self.children[tx].is_empty() {
+                    let _ = self.default_channel.0.send(tx);
+                } else {
+                    if !got_next {
+                        if let Some(version) = self.try_execute(tx) {
+                            next = Some(Task::Execution(version));
+                            got_next = true;
+                        }
                     } else {
-                        self.priority_channel.0.send(child).unwrap();
+                        let _ = self.priority_channel.0.send(tx);
                     }
                 }
             }
         }
-        // We might be double scheduling in here!
 
-        if followup_tx != 0 {
-            let version = self.try_execute(followup_tx);
-            if let Some(version) = version {
-                return Some(Task::Execution(version));
-            }
-            self.priority_channel.0.send(followup_tx).unwrap();
-        }
-        None
+        next
     }
 
     // Return whether the abort was successful. A successful abort leads to
