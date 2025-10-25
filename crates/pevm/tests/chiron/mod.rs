@@ -168,7 +168,7 @@ pub fn generate_loop_exchange(num_tx: usize) -> (HashMap<Address, EvmAccount>, B
             writes.push(res_distribution.sample(&mut rng)) ;
         }
 
-        println!("writes {:?}", &writes);
+        //println!("writes {:?}", &writes);
 
         let cost = U256::from(cost_sample.round() as u64);
         let calldata = Chiron::loop_exchange(cost, &writes);
