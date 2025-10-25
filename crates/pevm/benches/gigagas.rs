@@ -34,6 +34,9 @@ pub mod uniswap;
 #[path = "data/p2p.rs"]
 pub mod p2p;
 
+#[path = "../tests/chiron/mod.rs"]
+pub mod chiron;
+
 ///  large gas value
 const GIGA_GAS: u64 = 1_000_000_000;
 
@@ -43,13 +46,32 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 /// Runs a benchmark for executing a set of transactions on a given blockchain state.
 pub fn bench(c: &mut Criterion, name: &str, storage: InMemoryStorage, txs: Vec<TxEnv>) {
-    for cores in [2,4,6,8,10,12,14,16,18,20] {
+    for cores in [6,8,10,12,14,16,18,20] {
         let concurrency_level = NonZeroUsize::new(cores).unwrap();
         let chain = PevmEthereum::mainnet();
         let spec_id = SpecId::LATEST;
         let block_env = BlockEnv::default();
         let mut pevm = Pevm::default();
         let mut group = c.benchmark_group(name);
+        group.sample_size(10);
+
+        assert_eq!( execute_revm_sequential(
+                    black_box(&chain),
+                    black_box(&storage),
+                    black_box(spec_id),
+                    black_box(block_env.clone()),
+                    black_box(txs.clone()),
+                ),
+            pevm.execute_revm_parallel(
+                    black_box(&chain),
+                    black_box(&storage),
+                    black_box(spec_id),
+                    black_box(block_env.clone()),
+                    black_box(txs.clone()),
+                    black_box(concurrency_level),
+                    true
+                ));
+
 
         group.bench_function(&format!("Sequential {}", cores), |b| {
             b.iter(|| {
@@ -123,7 +145,6 @@ pub fn bench_raw_transfers(c: &mut Criterion) {
     let block_size = 10_000;
     // Skip the built-in precompiled contracts addresses.
     const START_ADDRESS: usize = 1000;
-    println!("go1 {} ", block_size);
 
     const MINER_ADDRESS: usize = 0;
     let storage = InMemoryStorage::new(
@@ -139,7 +160,6 @@ pub fn bench_raw_transfers(c: &mut Criterion) {
     let p2p_sender_distribution: WeightedIndex<f64> = WeightedIndex::new(&TX_FROM).unwrap();
     let mut rng: ThreadRng = thread_rng();
 
-    println!("go2");
     bench(
         c,
         "Independent Raw Transfers",
@@ -211,7 +231,7 @@ pub fn chiron_bench_uniswap(c: &mut Criterion, bursty: bool) {
 
     bench(
         c,
-        format!("Chiron Uniswap: {} bursty", load_type).as_str(),
+        format!("Chiron Uniswap: {} ", load_type).as_str(),
         InMemoryStorage::new(final_state, Arc::new(final_bytecodes), Default::default()),
         final_txs
     );
@@ -237,8 +257,24 @@ pub fn bench_uniswap(c: &mut Criterion) {
     );
 }
 
+/// Benchmarks the execution time of Solana/Mixed tx
+pub fn bench_solana(c: &mut Criterion) {
+    let block_size = 100;
+    let mut final_state = ChainState::from_iter([(Address::ZERO, EvmAccount::default())]); // Beneficiary
+    let (state, bytecodes, txs) = chiron::generate_loop_exchange(block_size);
+    final_state.extend(state);
+
+    bench(
+        c,
+        "Solana",
+        InMemoryStorage::new(final_state, Arc::new(bytecodes), Default::default()),
+        txs
+    );
+}
+
 /// Runs a series of benchmarks to evaluate the performance of different transaction types.
 pub fn benchmark_gigagas(c: &mut Criterion) {
+
     //bench_raw_transfers(c);
     //bench_erc20(c);
     //bench_uniswap(c);
@@ -247,9 +283,11 @@ pub fn benchmark_gigagas(c: &mut Criterion) {
     // They all seem to come from executiom, not from validation though, which is weird.
     //chiron_bench_erc20(c);
 
-    chiron_bench_erc20(c);
-    chiron_bench_uniswap(c, true);
-    chiron_bench_uniswap(c, false);
+    //chiron_bench_erc20(c);
+    //chiron_bench_uniswap(c, true);
+    //chiron_bench_uniswap(c, false);
+
+    bench_solana(c);
 }
 
 // HACK: we can't document public items inside of the macro

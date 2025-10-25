@@ -15,10 +15,10 @@ use revm::primitives::{uint, Address, TransactTo, TxEnv, U256};
 use crate::p2p::{TX_FROM, TX_TO};
 
 /// The maximum amount of gas that can be used for a transaction in this configuration.
-pub const GAS_LIMIT: u64 = 35_000;
+pub const GAS_LIMIT: u64 = 100_000;
 
 /// An estimated amount of gas that is expected to be consumed by typical transactions.
-pub const ESTIMATED_GAS_USED: u64 = 29_738;
+pub const ESTIMATED_GAS_USED : u64 = 29_738;
 
 /// Sometimes we want duplicates to test
 /// dependent transactions, sometimes we want to guarantee non-duplicates
@@ -120,6 +120,8 @@ pub fn generate_chiron_cluster(
 
     let mut sender_map = HashMap::new();
 
+    // todo add signature analysis to workload
+    
     for _ in 0..num_tx {
         let recipient = families[p2p_receiver_distribution.sample(&mut rng) % families.len()];
         let calldata = ERC20Token::transfer(recipient, U256::from(rand::random::<u8>()));

@@ -1,7 +1,7 @@
 use crate::common::storage::{StorageBuilder};
-use pevm::{BuildSuffixHasher, EvmAccount};
+use pevm::{EvmAccount};
 use revm::primitives::{
-    fixed_bytes, hex::FromHex, Bytecode, Bytes, HashMap, B256, U256,
+    fixed_bytes, hex::FromHex, Bytecode, Bytes, B256, U256,
 };
 
 /// `Chiron` contract bytecode
@@ -9,44 +9,20 @@ const CHIRON: &str = include_str!("./assets/Chiron.hex");
 
 #[derive(Debug, Default)]
 pub struct Chiron {
-    // Simulate the resource_table mapping(uint256 => uint256)
-    pub resource_table: HashMap<U256, U256, BuildSuffixHasher>,
 }
 
 impl Chiron {
-    /// Create a new Chiron instance
-    pub fn new() -> Self {
-        Self {
-            resource_table: HashMap::default(),
-        }
-    }
-
-    /// Add initial resources
-    pub fn add_resources(&mut self, resources: &[(U256, U256)]) -> &mut Self {
-        for (key, value) in resources {
-            self.resource_table.insert(*key, *value);
-        }
-        self
-    }
-
     /// Build the EVM account for PEVM
-    pub fn build(&self) -> EvmAccount {
+    pub fn build() -> EvmAccount {
         let hex = CHIRON.trim();
         let bytecode = Bytecode::new_raw(Bytes::from_hex(hex).unwrap());
-
-        let mut store = StorageBuilder::new();
-
-        // Map resource_table entries to storage
-        for (key, value) in &self.resource_table {
-            store.set(*key, *value);
-        }
 
         EvmAccount {
             balance: U256::ZERO,
             nonce: 1u64,
             code_hash: Some(bytecode.hash_slow()),
             code: Some(bytecode.into()),
-            storage: store.build(),
+            storage: StorageBuilder::new().build(),
         }
     }
 
