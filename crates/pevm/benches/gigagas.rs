@@ -281,11 +281,10 @@ pub fn benchmark_gigagas(c: &mut Criterion) {
 
     // The erc bench has around 1600/10k re-executions. Not that much, not that little.
     // They all seem to come from executiom, not from validation though, which is weird.
-    //chiron_bench_erc20(c);
 
-    //chiron_bench_erc20(c);
-    //chiron_bench_uniswap(c, true);
-    //chiron_bench_uniswap(c, false);
+    chiron_bench_erc20(c);
+    chiron_bench_uniswap(c, true);
+    chiron_bench_uniswap(c, false);
 
     bench_solana(c);
 }

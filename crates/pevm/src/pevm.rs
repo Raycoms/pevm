@@ -4,7 +4,9 @@ use std::{
     sync::{mpsc, Mutex, OnceLock},
     thread,
 };
-use alloy_primitives::{TxNonce, U256};
+use std::str::FromStr;
+use std::sync::atomic::Ordering;
+use alloy_primitives::{Address, Keccak256, PrimitiveSignature, Signature, TxNonce, B256, U256};
 use alloy_rpc_types_eth::{Block, BlockTransactions};
 use hashbrown::HashMap;
 use revm::{
@@ -12,20 +14,31 @@ use revm::{
     primitives::{BlockEnv, InvalidTransaction, SpecId, TxEnv},
     DatabaseCommit,
 };
-use crate::{
-    chain::PevmChain,
-    compat::get_block_env,
-    hash_deterministic,
-    mv_memory::MvMemory,
-    scheduler::BlockSTMScheduler,
-    storage::StorageWrapper,
-    vm::{
-        build_evm, ExecutionError, PevmTxExecutionResult, Vm, VmExecutionError, VmExecutionResult,
-    },
-    EvmAccount, MemoryEntry, MemoryLocation, MemoryValue, Storage, Task, TxIdx, TxVersion,
-};
+use once_cell::sync::Lazy;
+use crate::{chain::PevmChain, compat::get_block_env, hash_deterministic, mv_memory::MvMemory, scheduler::BlockSTMScheduler, storage::StorageWrapper, vm::{
+    build_evm, ExecutionError, PevmTxExecutionResult, Vm, VmExecutionError, VmExecutionResult,
+}, EvmAccount, MemoryEntry, MemoryLocation, MemoryValue, Storage, Task, TxIdx, TxVersion};
 use crate::chiron_scheduler::ChironScheduler;
 use crate::scheduler::Scheduler;
+
+
+static MESSAGE: &str = "hello world";
+
+static MSG_HASH: Lazy<B256> =Lazy::new(|| {
+let mut hasher = Keccak256::new();
+hasher.update(MESSAGE.as_bytes());
+hasher.finalize()
+});
+
+static SIG: Lazy<PrimitiveSignature> = Lazy::new(|| {
+    PrimitiveSignature::new(
+        U256::from_str("0xdcf7ead547cf6de19daeb554870ae972b9c8b74e3fdc5a74e7bc688e598be3a7").unwrap(),
+        U256::from_str("0x7c3e292affcc9dd8b84e89c76d2528951d1a08ff957478008c0ae47be71051ce").unwrap(),
+        false,
+    )
+});
+
+static EXPECTED_ADDR: Lazy<Address> = Lazy::new(|| Address::from_str("0xFCAd0B19bB29D4674531d6f115237E16AfCE377c").unwrap());
 
 /// Errors when executing a block with pevm.
 // TODO: implement traits explicitly due to trait bounds on `C` instead of types of `PevmChain`
@@ -216,6 +229,21 @@ impl Pevm {
                             Task::Validation(tx_version) => {
                                 try_validate(&mv_memory, &scheduler, &tx_version)
                             }
+                            Task::SigVerification() => {
+                                let idx = scheduler.fetch_verify_sig_val_batch();
+                                if idx <= block_size {
+                                    for i in 0..24 {
+                                        if idx + i < block_size {
+                                            let recovered = SIG.recover_address_from_prehash(&*MSG_HASH).unwrap();
+                                            if recovered != *EXPECTED_ADDR {
+                                                scheduler.abort();
+                                                println!("Wrong signature, aborting!")
+                                            }
+                                        }
+                                    }
+                                }
+                                None
+                            }
                         };
 
                         // TODO: Have different functions or an enum for the caller to choose
@@ -232,11 +260,9 @@ impl Pevm {
                             task = scheduler.next_task();
                         }
                     }
-                });
+            });
             }
         });
-
-        //println!("Finished parallel: {}", time.elapsed().as_millis());
 
         if let Some(abort_reason) = self.abort_reason.take() {
             match abort_reason {

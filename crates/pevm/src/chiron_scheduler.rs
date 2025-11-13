@@ -70,18 +70,20 @@ pub(crate) struct ChironScheduler {
     // True if the scheduler has been aborted, likely due to fatal execution
     // errors.
     aborted: AtomicBool,
-
+    // Validation lock to avoid concurrent validation.
     val_lock: Mutex<bool>,
-
+    // Non priority transaction execution channel.
     pub(crate) default_channel: (flume::Sender<TxIdx>, flume::Receiver<TxIdx>),
-
+    // Priority transaction execution channel.
     pub(crate) priority_channel: (flume::Sender<TxIdx>, flume::Receiver<TxIdx>),
-
+    // Critical slow parent of a set of a tx_i
     pub critical_path_parent: Vec<boxcar::Vec<usize>>,
-
+    // All transactions that depend on a tx_i.
     pub children: Vec<Vec<TxIdx>>,
-
+    // All transaction a tx_i depends on.
     pub parents: Vec<Vec<u16>>,
+    // The number of verified signatures
+    num_sig_verified: AtomicUsize,
 }
 
 impl ChironScheduler {
@@ -148,7 +150,8 @@ impl ChironScheduler {
             }
         }
 
-        // 3-4ms atm
+        // 3-4ms atm for normal workloads
+        // 10-12ms for solana
         // println!("took {}", now.elapsed().as_millis());
 
         // 1ms for 10k, 10ms for 50k
@@ -171,7 +174,8 @@ impl ChironScheduler {
             priority_channel,
             children,
             critical_path_parent,
-            parents
+            parents,
+            num_sig_verified: AtomicUsize::new(0),
         }
     }
 
@@ -245,13 +249,20 @@ impl Scheduler for ChironScheduler {
             // Check if we finished and can stop execution.
             let validation_idx = self.validation_idx.load(Ordering::Relaxed);
             if validation_idx >= self.block_size {
+                let idx = self.num_sig_verified.load(Ordering::Relaxed);
+                if idx <= self.block_size {
+                    return Some(Task::SigVerification())
+                }
                 break;
             }
 
             if let Some(tx_version) = self.try_validate() {
                 return Some(Task::Validation(tx_version));
             }
-            //return Some(Task::SigVerification(validation_idx))
+            let idx = self.num_sig_verified.load(Ordering::Relaxed);
+            if idx <= self.block_size {
+                return Some(Task::SigVerification())
+            }
         }
         None
     }
@@ -263,21 +274,15 @@ impl Scheduler for ChironScheduler {
     fn add_dependency(&self, tx_idx: TxIdx, blocking_tx_idx: TxIdx) -> bool {
         // This is an important lock to prevent a race condition where the blocking
         // transaction completes re-execution before this dependency can be added.
-        let blocking_tx = read_index_mutex!(self.transactions_status, blocking_tx_idx);
-        if matches!(
-            blocking_tx.status,
-            IncarnationStatus::Executed | IncarnationStatus::Validated
-        ) {
-            return false;
-        }
 
+        println!("This should never happen. Transaction detected as dependent, re-scheduling! {}", tx_idx);
         let mut tx = write_index_mutex!(self.transactions_status, tx_idx);
         debug_assert_eq!(tx.status, IncarnationStatus::Executing);
-        tx.status = IncarnationStatus::Aborting;
+        tx.status = IncarnationStatus::ReadyToExecute;
+        tx.incarnation += 1;
 
-        //let mut blocking_dependents = index_mutex!(self.transactions_dependents, blocking_tx_idx);
-        //blocking_dependents.push(tx_idx);
-        panic!("This should never happen. Transaction detected as dependent");
+        let _ = self.priority_channel.0.send(tx_idx);
+        true
     }
 
     fn set_ready_status(&self, tx_idx: TxIdx) {
@@ -358,5 +363,9 @@ impl Scheduler for ChironScheduler {
             }
         }
         None
+    }
+
+    fn fetch_verify_sig_val_batch(&self) -> usize {
+        self.num_sig_verified.fetch_add(25, Ordering::Acquire)
     }
 }

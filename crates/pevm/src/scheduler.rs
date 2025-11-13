@@ -61,6 +61,8 @@ pub(crate) trait Scheduler : Send + Sync + Debug {
     // and the higher transactions for validation. The re-execution task is returned
     // for the aborted transaction.
     fn finish_validation(&self, tx_version: &TxVersion, aborted: bool) -> Option<Task>;
+    // Fetch a batch of client tx signatures to verify.
+    fn fetch_verify_sig_val_batch(&self) -> usize;
 }
 
 
@@ -88,6 +90,8 @@ pub(crate) struct BlockSTMScheduler {
     // True if the scheduler has been aborted, likely due to fatal execution
     // errors.
     aborted: AtomicBool,
+    // The number of verified signatures
+    num_sig_verified: AtomicUsize,
 }
 
 impl BlockSTMScheduler {
@@ -110,6 +114,7 @@ impl BlockSTMScheduler {
             min_validation_idx: AtomicUsize::new(block_size),
             num_validated: AtomicUsize::new(0),
             aborted: AtomicBool::new(false),
+            num_sig_verified: AtomicUsize::new(0),
         }
     }
 }
@@ -140,6 +145,11 @@ impl Scheduler for BlockSTMScheduler {
             let execution_idx = self.execution_idx.load(Ordering::Relaxed);
             let validation_idx = self.validation_idx.load(Ordering::Relaxed);
             if execution_idx >= self.block_size && validation_idx >= self.block_size {
+                let idx = self.num_sig_verified.load(Ordering::Relaxed);
+                if idx <= self.block_size {
+                    return Some(Task::SigVerification())
+                }
+
                 if self.num_validated.load(Ordering::Relaxed)
                     >= self.block_size - self.min_validation_idx.load(Ordering::Relaxed)
                 {
@@ -177,6 +187,10 @@ impl Scheduler for BlockSTMScheduler {
                     // new loop iteration to refetch the latest indices
                     // before deciding again.
                     if tx.status == IncarnationStatus::Aborting {
+                        let idx = self.num_sig_verified.load(Ordering::Relaxed);
+                        if idx <= self.block_size {
+                            return Some(Task::SigVerification())
+                        }
                         continue;
                     }
                     // Fall back to execution job as this executing tx will
@@ -329,5 +343,9 @@ impl Scheduler for BlockSTMScheduler {
             }
         }
         None
+    }
+
+    fn fetch_verify_sig_val_batch(&self) -> usize {
+        self.num_sig_verified.fetch_add(25, Ordering::Acquire)
     }
 }

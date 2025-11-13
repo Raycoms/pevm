@@ -185,6 +185,7 @@ type WriteSet = Vec<(MemoryLocationHash, MemoryValue)>;
 enum Task {
     Execution(TxVersion),
     Validation(TxVersion),
+    SigVerification(),
 }
 
 bitflags! {

@@ -865,6 +865,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "boxcar"
+version = "0.2.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "36f64beae40a84da1b4b26ff2761a5b895c12adc41dc25aaee1c4f2bbfe97a6e"
+
+[[package]]
 name = "bumpalo"
 version = "3.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3027,14 +3033,17 @@ dependencies = [
  "bincode",
  "bitflags 2.7.0",
  "bitvec",
+ "boxcar",
  "criterion",
  "crossbeam",
  "dashmap",
  "flate2",
  "flume",
  "hashbrown 0.15.2",
+ "hex",
  "indexset",
  "nohash-hasher",
+ "once_cell",
  "op-alloy-consensus",
  "op-alloy-network",
  "op-alloy-rpc-types",
