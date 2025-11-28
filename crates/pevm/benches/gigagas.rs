@@ -61,6 +61,7 @@ pub fn bench(c: &mut Criterion, name: &str, storage: InMemoryStorage, txs: Vec<T
                     black_box(spec_id),
                     black_box(block_env.clone()),
                     black_box(txs.clone()),
+                    black_box(concurrency_level),
                 ),
             pevm.execute_revm_parallel(
                     black_box(&chain),
@@ -81,6 +82,8 @@ pub fn bench(c: &mut Criterion, name: &str, storage: InMemoryStorage, txs: Vec<T
                     black_box(spec_id),
                     black_box(block_env.clone()),
                     black_box(txs.clone()),
+                    black_box(concurrency_level)
+                    ,
                 )
             })
         });
@@ -259,7 +262,7 @@ pub fn bench_uniswap(c: &mut Criterion) {
 
 /// Benchmarks the execution time of Solana/Mixed tx
 pub fn bench_solana(c: &mut Criterion) {
-    let block_size = 100;
+    let block_size = 10_000;
     let mut final_state = ChainState::from_iter([(Address::ZERO, EvmAccount::default())]); // Beneficiary
     let (state, bytecodes, txs) = chiron::generate_loop_exchange(block_size);
     final_state.extend(state);

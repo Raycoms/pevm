@@ -4,6 +4,7 @@ use std::{
     sync::{mpsc, Mutex, OnceLock},
     thread,
 };
+use std::num::NonZero;
 use std::str::FromStr;
 use std::sync::atomic::Ordering;
 use alloy_primitives::{Address, Keccak256, PrimitiveSignature, Signature, TxNonce, B256, U256};
@@ -161,7 +162,7 @@ impl Pevm {
             || tx_envs.len() < concurrency_level.into()
             || block.header.gas_used < 4_000_000
         {
-            execute_revm_sequential(chain, storage, spec_id, block_env, tx_envs)
+            execute_revm_sequential(chain, storage, spec_id, block_env, tx_envs, concurrency_level)
         } else {
             self.execute_revm_parallel(
                 chain,
@@ -268,7 +269,7 @@ impl Pevm {
             match abort_reason {
                 AbortReason::FallbackToSequential => {
                     self.dropper.drop((mv_memory, scheduler, Vec::new()));
-                    return execute_revm_sequential(chain, storage, spec_id, block_env, txs);
+                    return execute_revm_sequential(chain, storage, spec_id, block_env, txs, concurrency_level);
                 }
                 AbortReason::ExecutionError(err) => {
                     self.dropper.drop((mv_memory, scheduler, txs));
@@ -490,11 +491,13 @@ pub fn execute_revm_sequential<S: Storage, C: PevmChain>(
     spec_id: SpecId,
     block_env: BlockEnv,
     txs: Vec<TxEnv>,
+    concurrency_level: NonZero<usize>,
 ) -> PevmResult<C> {
     let mut db = CacheDB::new(StorageWrapper(storage));
     let mut evm = build_evm(&mut db, chain, spec_id, block_env, None, true);
     let mut results = Vec::with_capacity(txs.len());
     let mut cumulative_gas_used: u64 = 0;
+    let len = txs.len();
     for tx in txs {
         *evm.tx_mut() = tx;
 
@@ -514,6 +517,33 @@ pub fn execute_revm_sequential<S: Storage, C: PevmChain>(
 
         results.push(execution_result);
     }
+
+    thread::scope(|scope| {
+        let len_copy: usize = len.clone();
+        for j in 0..(concurrency_level.into()) {
+            let j_copy: usize = j;
+            let conc: usize = concurrency_level.get().clone().into();
+
+            scope.spawn(move || {
+                let interval = conc * 24;
+                let mut idx = j_copy * 24;
+
+                while idx < len_copy {
+                    for i in 0..24 {
+                        if idx + i < len_copy {
+                            let recovered = SIG.recover_address_from_prehash(&*MSG_HASH).unwrap();
+                            if recovered != *EXPECTED_ADDR {
+                                println!("Wrong signature, aborting!");
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                    idx += interval;
+                }
+            });
+        }
+    });
 
     //println!("{:?}", results.get(0).unwrap());
     //println!("{:?}", results.get(results.len() - 1).unwrap());

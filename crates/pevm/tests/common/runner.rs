@@ -36,6 +36,7 @@ where
             SpecId::LATEST,
             BlockEnv::default(),
             txs.clone(),
+            concurrency_level,
         ),
         Pevm::default().execute_revm_parallel(
             chain,
